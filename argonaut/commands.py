@@ -619,7 +619,7 @@ class Command:
             "build": build,
             "epilog": epilog,
             "version": version,
-            "licence": license,
+            "license": license,
             "homepage": homepage,
             "copyright": copyright,    
 
