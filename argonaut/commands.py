@@ -615,6 +615,13 @@ class Command:
             "parent": parent,
             "name": name,
             "descr": descr,
+            "usage": usage,
+            "build": build,
+            "epilog": epilog,
+            "version": version,
+            "licence": license,
+            "homepage": homepage,
+            "copyright": copyright,    
 
             # Structure
             "children": (children := {}),
