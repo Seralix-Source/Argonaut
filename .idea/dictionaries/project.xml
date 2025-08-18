@@ -2,12 +2,17 @@
   <dictionary name="project">
     <words>
       <w>alnum</w>
+      <w>appendleft</w>
+      <w>arities</w>
       <w>cmdtype</w>
+      <w>defaultdict</w>
       <w>globbed</w>
       <w>ispkg</w>
       <w>kwdefaults</w>
+      <w>lifecyle</w>
       <w>pkgutil</w>
       <w>reishin</w>
+      <w>seralix</w>
       <w>triggerables</w>
     </words>
   </dictionary>
