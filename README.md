@@ -1,1 +1,1 @@
-# **Seralix-Argonaut**
+# Argonaut

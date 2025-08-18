@@ -1,3 +1,75 @@
+"""
+argonaut.commands
+~~~~~~~~~~~~~~~~~
+
+Public API for declaring and running command trees.
+
+What this module provides
+- Command: a node in a command hierarchy (root or subcommand).
+- command(...): decorator/factory to create a Command from a callable or an
+  iterable of argument specifications.
+- invoke(...): convenience runner that parses argv (or a provided prompt),
+  runs callbacks, and returns either None (if a handler ran) or the parsed
+  namespace mapping (if no handler was associated with the resolved command).
+
+Two ways to define commands
+- Decorator-based:
+    >>> from argonaut import *
+    >>>
+    >>> @command(name="cli")
+    >>> def cli(
+    ...     file: str = Cardinal(),
+    ...     /,
+    ...     *,
+    ...     verbose: bool = Flag("-v", "--verbose"),
+    ... ) -> None:
+    ...     pass
+    >>>
+    >>> @cli.command(name="sub")
+    >>> def sub(
+    ...     count: int = Option("-n", "--count", type=int, default=1),
+    ... ) -> None:
+    ...     pass
+
+- Iterable-based:
+    >>> from argonaut import *
+    >>>
+    >>> cli = command([
+    ...     Cardinal(),
+    ...     Flag("-v", "--verbose"),
+    ... ])
+    >>>
+    >>> sub = cli.command([
+    ...     Option("-n", "--count", type=int, default=1),
+    ... ])
+
+Decorator vs factory
+- The top-level command(...) and the bound method Command.command(...) accept either:
+  • no positional source (returning a decorator), or
+  • a callable or an iterable of argument specs (returning a Command immediately).
+- Do not stack the two styles for the same command: use one or the other for clarity.
+
+Invoking
+- invoke(cmd) parses sys.argv[1:] by default. Pass a string or an iterable of strings
+  to override input: invoke(cmd, "--flag value").
+- If the resolved command has a handler (callable source), that handler is executed
+  and invoke(...) returns None. If it has no handler (iterable-defined), the parsed
+  namespace is returned as a dict[str, Any].
+
+Helpful properties on Command
+- stderr/stdout: preconfigured rich.Console instances.
+- patriarch: top-most ancestor Command in the tree.
+- rootpath: tuple of Commands from the root (excluded in some descriptions) down to self.
+- namespace: deep copy of last parsed mapping, or None if not available.
+- tokens: deep copy of the remaining token deque from the last parse, or None.
+
+Notes
+- Use methodize=True to write handlers as instance-style functions (first param is self/this).
+- Helper switches (e.g., -h/--help, -v/--version) are injected automatically unless provided.
+- Only orphan commands can be attached to a parent; existing parents are not overridden.
+"""
+import copy
+import difflib
 import functools
 import inspect
 import os
@@ -6,605 +78,467 @@ import shlex
 import sys
 import textwrap
 from collections import deque, defaultdict
-from collections.abc import Iterable, Mapping
+from collections.abc import Sequence, Mapping, Set
 from inspect import Parameter
-from types import MemberDescriptorType
+from re import IGNORECASE
+from types import MemberDescriptorType, MappingProxyType
+from typing import Iterable, ChainMap
+from warnings import catch_warnings
 
+from rich.console import Console, Group
+from rich.panel import Panel
 from rich.style import Style
+from rich.table import Table
+from rich.text import Text
 
-from .arguments import Operand, Option, Switch
-from .faults import *
-from .null import null
-from .null import _update_name, _frozen_property  # NOQA: Internal
-
-
-class SkipToken(Exception):
-    """internal sentinel: skip the current token without aborting parsing."""
-    pass
+from .arguments import Cardinal, Option, Flag
+from .triggers import *
+from .void import *
 
 
-def _get_invoker(callback):
-    """
-    Synthesize an instance-bound __call__ that forwards to the registered handler,
-    mirroring the handler's signature as closely as possible.
+class SentinelException(Exception): ...
 
-    What this does
-    - Builds a __call__(...) method dynamically so that a Command instance can be
-      invoked with the same parameter shape as the original handler function.
-    - Preserves positional-only, positional-or-keyword, and keyword-only sections:
-        • Inserts '/' once to mark the end of positional-only parameters.
-        • Inserts '*' once to mark the beginning of keyword-only parameters.
-    - Renames the implicit instance parameter to avoid shadowing a handler whose
-      first parameter is literally named "self".
 
-    Parameters
-    - callback: an object with:
-        • parameters: list[inspect.Parameter] in declaration order
-          (each with .name, .kind, .default),
-        • (optional) other attributes used upstream for defaults extraction.
+# Update the name of a callable and return itself to avoid exposing names like "_get_call.<locals>._decorator"
+def _update_name(callable, newname=None):
+    if not isinstance(callable, str):
+        callable.__qualname__ = newname
+        callable.__name__ = newname
+        return callable
+    return functools.partial(_update_name, newname=callable)
 
-    Generated behavior
-    - __call__(self, ...) simply dispatches to self._callback(...)
-      with positional args first and keyword-only args passed as keywords.
-    - __defaults__ is populated from non-keyword-only parameters that provide a
-      default; internal sentinels are normalized via null.nullify(...).
-    - __kwdefaults__ is seeded for keyword-only parameters to signal presence
-      flags (False by default), aligning with the surrounding invocation logic.
 
-    Notes
-    - This is performance-sensitive. It compiles exactly once per unique callback
-      shape (per construction site) and avoids repeated signature manipulation.
-    - The resulting __call__ carries a stable name via @_update_name("__call__")
-      to keep tracebacks and pretty output clean.
-    """
-    # Choose an instance name that won't collide with a handler named "self"
-    parameters = [self := "__self__" if callback.parameters and callback.parameters[0] == "self" else "self"]
+# Build the property for the dynamic class ensuring that the collections become immutable
+def _build_property(name, metadata):
+    if isinstance(metadata[name], Sequence) and not isinstance(metadata[name], str):
+        metadata[name] = tuple(metadata[name])
+    elif isinstance(metadata[name], Mapping):
+        metadata[name] = MappingProxyType(metadata[name])
+    elif isinstance(metadata[name], Set):
+        metadata[name] = frozenset(metadata[name])
+    return property(_update_name(lambda self: metadata[name], name))
 
-    # Track whether we've emitted the positional-only separator '/' or the
-    # keyword-only separator '*'
+
+# Generate the signature and the arguments for the dynamic call method
+def _build_call(callback):
+    # Inspect the original callback signature (ordered mapping of name -> Parameter)
+    signature = inspect.signature(callback)
+
+    # Avoid shadowing: if the callback’s first parameter is literally named "self",
+    # rename the wrapper's instance parameter to "__command__" so both can coexist.
+    self = "__command__" if next(iter(signature.parameters), None) == "self" else "self"
+
+    # parameters: tokens for the generated function's parameter list
+    # arguments: tokens used to forward the call into self._callback(...)
+    parameters = []
+    arguments = []
+
+    # slashed: whether '/' (end of positional-only section) has been inserted
+    # starred: whether '*' (start of keyword-only section) has been inserted
     slashed = False
     starred = False
 
-    # Recreate the handler's shape:
-    # - emit '/' once before the first non-pos-only parameter (if any)
-    # - emit '*' once before the first keyword-only parameter (if any)
-    for parameter in callback.parameters:
+    # Walk the original parameters in order and rebuild a compatible signature.
+    # We emit:
+    # - '/' once, right when we encounter the first non-positional-only param (only if there were pos-only params).
+    # - '*' when we encounter keyword-only params (only once, and only if not already separated by *args).
+    for name, parameter in signature.parameters.items():
+        # If we transition from the (implicit) positional-only section to a non-positional-only param,
+        # emit '/' exactly once. If there were no positional-only params, we'll delete the stray '/'
+        # right after the loop (see below).
         if parameter.kind is Parameter.POSITIONAL_OR_KEYWORD and not slashed:
-            parameters.append("/")
+            parameters.append("/")  # Added only if there were positional-only parameters
             slashed = True
-        if parameter.kind is Parameter.KEYWORD_ONLY and not starred:
-            if not slashed:
-                parameters.append("/")
-                slashed = True
+
+        # If we reach a keyword-only parameter, make sure the keyword-only section is introduced.
+        # This is done by adding a bare '*'. (If *args existed, that would also serve as the separator.)
+        if parameter.kind is Parameter.KEYWORD_ONLY:  # Correct: keyword-only section requires '*'
             parameters.append("*")
             starred = True
-        parameters.append(parameter.name)
 
-    # Build the forwarding lists:
-    # - positional-or-keyword and positional-only go as positional args
-    # - keyword-only become named arguments
-    args = ", ".join(
-        f"{parameter.name}" for parameter in callback.parameters
-        if parameter.kind is not Parameter.KEYWORD_ONLY
+        # Always append the parameter name itself to the wrapper signature.
+        parameters.append(name)
+
+        # When forwarding:
+        # - keyword-only parameters must be passed with 'name=name'
+        # - others are forwarded positionally by name
+        arguments.append(f"{name}={name}" if parameter.kind is Parameter.KEYWORD_ONLY else name)
+
+    # If the very first token became '/', that means the callback had no positional-only parameters.
+    # Remove it so we don't advertise a pos-only section that doesn't exist.
+    if parameters and parameters[0] == "/":
+        parameters.pop(0)
+
+    # Prepend the instance parameter ('self' or '__command__') to the wrapper signature.
+    parameters.insert(0, self)
+
+    # Dynamically define the wrapper with the constructed signature and forward into _callback(...)
+    exec(textwrap.dedent(f"""
+        def function({", ".join(parameters)}):
+            return {self}._callback({", ".join(arguments)})
+    """), globals(), namespace := {})
+    function = namespace["function"]
+
+    # Rebuild defaults for non-keyword-only parameters:
+    # - void.nullify(...) transforms sentinel defaults into runtime-safe values per project conventions.
+    function.__defaults__ = tuple(
+        void.nullify(parameter.default.default) for parameter in signature.parameters.values()
+        if parameter.kind is not Parameter.KEYWORD_ONLY and parameter.default is not Parameter.empty
     )
-    kwargs = ", ".join(
-        f"{parameter.name}={parameter.name}" for parameter in callback.parameters
+
+    # For keyword-only parameters, record presence flags (per project conventions).
+    function.__kwdefaults__ = dict(
+        (name, False) for name, parameter in signature.parameters.items()
         if parameter.kind is Parameter.KEYWORD_ONLY
     )
 
-    # Compile a concrete __call__ with the reconstructed signature
-    exec(textwrap.dedent(f"""
-        @_update_name("__call__")
-        def __call__({", ".join(parameters)}):
-            return {self}._callback({", ".join([args, kwargs])})
-    """), globals(), namespace := {})
-
-    # Positional defaults (excluding keyword-only): null → real default, else pass-through
-    namespace["__call__"].__defaults__ = tuple(
-        null.nullify(parameter.default.default)
-        for parameter in callback.parameters if parameter.kind is not Parameter.KEYWORD_ONLY
-    )
-
-    # Keyword-only defaults: presence flags (False by default)
-    namespace["__call__"].__kwdefaults__ = {
-        parameter.name: False
-        for parameter in callback.parameters if parameter.kind is Parameter.KEYWORD_ONLY
-    }
-
-    return namespace["__call__"]
+    function.__annotations__ = callback.__annotations__
+    return function
 
 
-def __type__(cls, metadata):
-    """
-    Internal: synthesize a concrete command type from a base class and a metadata map.
+# Dynamically initiates a new type according to the metadata info
+def _cmdtype(cls, metadata):
+    __typename__ = re.sub(r"(?<!^)(?=[A-Z])", "_", cls.__name__).lower()
 
-    Purpose
-    - Build a lightweight, immutable “view” over the construction‑time metadata
-      dict and expose each field as a read‑only attribute via _frozen_property.
-    - Attach a one‑shot fallback(...) setter and, when a real callback exists,
-      a __call__ whose signature mirrors the handler (compiled by _get_invoker).
-    - Provide minimal __repr__/__rich_repr__ hooks for diagnostics and help.
-
-    Inputs
-    - cls: the abstract base (e.g., Command) whose name determines the user‑facing
-      typename (converted to kebab‑case).
-    - metadata: dict[str, Any] whose keys correspond to the command’s attributes
-      (already validated and normalized upstream).
-
-    Generated members
-    - Read‑only properties for all metadata keys (via _frozen_property).
-    - fallback(self, func): single‑assignment fallback handler; returns the func
-      for decorator‑style usage.
-    - __call__(...): only when a real callback is present; forwards to self._callback
-      with a signature built by _get_invoker.
-    - __repr__/__rich_repr__: concise diagnostics and Rich‑friendly iteration.
-    - __init_subclass__: forbid subclassing of the synthesized type.
-
-    Notes
-    - This factory only wires behavior and freezes the current metadata snapshot.
-      Any mutations should be completed by processing helpers before calling this.
-    - Properties reflect the snapshot; later mutations of the original dict do
-      not affect instances.
-    """
-    __name__ = re.sub(r"(?<!^)(?=[A-Z])", "-", cls.__name__).lower()
-
-    @_update_name("fallback")
-    def fallback(self, fallback):
-        """
-        Single‑assignment fallback setter.
-
-        Contract
-        - Must be callable; raises TypeError otherwise.
-        - Can only be set once; raises TypeError if already set.
-        - Returns the same callable to support decorator usage.
-        """
+    def _fallback(self, fallback):
         if not callable(fallback):
-            raise TypeError(f"{__name__} fallback must be callable")
-        if self._fallback is not null:
-            raise TypeError(f"{__name__} fallback cannot be changed after initialization")
+            raise TypeError(f"{__typename__} fallback must be callable")
+        if self._fallback is not void:
+            raise TypeError(f"{__typename__} fallback already set")
         self._fallback = fallback
         return fallback
 
-    @_update_name("__repr__")
-    def __repr__(self):
-        """
-        Debug‑friendly repr.
-
-        Shape
-        - <typename>(key=value, ...) using the current metadata snapshot.
-        - Intentionally compact; rich rendering uses __rich_repr__.
-        """
-        return f"{__name__}({', '.join('%s=%r' % item for item in metadata.items())})"
-
-    @_update_name("__rich_repr__")
-    def __rich_repr__(self):
-        """
-        Rich‑friendly representation.
-
-        Behavior
-        - Yield (key, value) pairs so Rich can render a table‑like display.
-        - Keeps parity with __repr__ while allowing styled output in help.
-        """
-        yield from metadata.items()
-
-    @_update_name("__init_subclass__")
-    def __init_subclass__(cls, **options):
-        """
-        Forbid subclassing of synthesized command types.
-
-        Rationale
-        - These concrete types are generated and finalized at construction time.
-          Allowing subclassing would break immutability guarantees and expand
-          surface area without benefit.
-        """
-        raise TypeError(f"type {__name__!r} is not an acceptable base type")
+    def _init_subclass():
+        raise TypeError(f"type {__typename__!r} is not an acceptable base type")
 
     return type(cls)(
-        __name__,
-        (cls, *cls.__bases__),
-        {
-            # Keep only plain attributes (skip descriptors) to avoid conflicts.
+        __typename__,
+        (cls,) + cls.__bases__,
+        {  # Clear members of the class to avoid conflicts with the slots
             name: object for name, object in cls.__dict__.items() if not isinstance(object, MemberDescriptorType)
-        } | {
-            # Freeze and expose metadata fields as read‑only properties.
-            name: _frozen_property(name, metadata) for name in metadata.keys()
-        } | {
-            # Single‑assignment fallback setter.
-            "fallback": fallback
-        } | ({ # Arity‑sensitive invoker (only when a real callback exists).
-            "__call__": _get_invoker(callback)
-         } if (callback := metadata.pop("callback")) is not _dummy_callback else {}) | {
-            # Diagnostics and subclassing guard.
-            "__repr__": __repr__,
-            "__rich_repr__": __rich_repr__,
-            "__init_subclass__": __init_subclass__
-        } | {
-            "__module__": "<argonaut-dynamic>"
-        }
+        } | {  # Inject the readonly attributes
+            name: _build_property(name, metadata) for name in metadata.keys()
+        } | {  # Inject the fallback setter (one-life usable)
+            "fallback": _update_name(
+                lambda self, fallback: _fallback(self, fallback), "fallback"
+            ),
+        } | {  # Inject the two reprs (including rich support)
+            "__repr__": _update_name(
+                lambda self: f"{__typename__}({", ".join("%s=%r" % item for item in metadata.items())})", "__repr__"
+            ),
+            "__rich_repr__": _update_name(
+                lambda self: metadata.items(), "__rich_repr__"
+            )
+        } | {  # Inject the dynamic class final
+            "__init_subclass__": _update_name(
+                lambda cls, **options: _init_subclass(), "__init_subclass__"
+            )
+        } | ({
+            "__call__": _update_name(
+                _build_call(metadata["callback"]), "__call__"
+            )
+        } if metadata["callback"] is not _dummy_callback else {})
     )
 
 
 def _dummy_callback(*args, **kwargs):
-    """
-    Sentinel handler used for schema‑only commands (no explicit callback).
-
-    When it is set
-    - The command was constructed from an iterable of specs (operands/option/switch),
-      or otherwise without a callable handler.
-
-    Contract
-    - This function must never be executed as a real handler.
-      Its presence signals the invoker/parser to return the parsed namespace instead of calling a callback.
-      If it is reached, something bypassed the normal control flow.
-
-    Why raise here
-    - Failing loudly prevents accidental execution paths that would otherwise
-      silently “succeed” without running user code, making debugging harder.
-
-    Typical flow
-    - Build the command without a handler (iterable schema).
-    - Invoke it: the runtime detects the sentinel and returns a dict‑like
-      namespace of parsed values (rather than calling a handler).
-
-    Developer note
-    - Other parts of the system rely on identity checks against this sentinel
-      (e.g., `self._callback is _dummy_callback`) to choose the correct return
-      behavior.
-      Do not replace or wrap it with another callable.
-    """
-    raise NotImplementedError("no callback: command returns a parsed namespace")
+    raise NotImplementedError("dummy-callback is not intended to be called")
 
 
-_number = lambda number: {
-    1: "first",
-    2: "second",
-    3: "third",
-    4: "fourth",
-    5: "fifth",
-    6: "sixth",
-    7: "seventh",
-    8: "eighth",
-    9: "ninth",
-    10: "tenth",
-}.get(number, f"{number}th")
-
-
-def _get_callback(cls, source, metadata):
-    """
-    Normalize the provided `source` (callable or iterable of specs) into a concrete callback
-    and populate the command's argument indices in-place.
-
-    Purpose
-    - Build the argument schema for a Command by inspecting either:
-      • a handler signature (decorator style), or
-      • an iterable of specs (factory style).
-    - While doing so, enforce ordering and shape constraints that yield a predictable UX.
-    - Record every declared spec into a read-only grouping index (metadata["groups"]),
-      keyed by the spec's group name, preserving declaration order.
-
-    Inputs
-    - cls:     the Command class (used for error messages and normalization).
-    - source:  a callable with defaulted parameters whose defaults are “argument‑resoluble”
-               objects (operand/option/switch), or an iterable of such resoluble objects.
-               An “argument‑resoluble” object provides exactly one of:
-                 __operand__(), __option__(), or __switch__().
-    - metadata: dict with the mutable indices to be populated:
-        • operands:   name→Operand (for callable) or index→Operand (for iterable)
-        • qualifiers: alias→Option/Switch (names deduplicated/validated)
-        • groups:     group-name→tuple(specs...) (filled here in declaration order)
-
-    Rules and validations
-    - Argument‑resoluble: defaults (or iterable items) must yield exactly one of Operand/Option/Switch.
-    - Ordering:
-      • Operands must come first; once a qualifier is seen, no more operands are allowed.
-      • Within qualifiers: options and switches may interleave, but name collisions are forbidden.
-    - Handler signature shape (callable only):
-      • No *args/**kwargs.
-      • Operands must be positional‑only.
-      • Options must be positional‑or‑keyword (standard parameters).
-      • Switches must be keyword‑only.
-    - Greedy positional (Operand with nargs=Ellipsis):
-      • Only one greedy operand is permitted.
-      • It must be the last operand in the declaration.
-    - Hidden/deprecated sequencing for operands:
-      • Non‑hidden operands cannot follow a hidden one.
-      • Non‑deprecated operands cannot follow a deprecated one.
-
-    Returns
-    - The concrete callback stored in metadata["callback"], or the internal _dummy_callback
-      if `source` was an iterable (schema‑only command).
-
-    Raises
-    - TypeError for any shape/order violations or name collisions.
-    """
-    __name__ = re.sub(r"(?<!^)(?=[A-Z])", "-", cls.__name__).lower()
-    operands = metadata["operands"]
-    qualifiers = metadata["qualifiers"]
-
-    # Parsing state for ordering/constraints across declaration
-    active = "operand"        # "operand" → still accepting operands; otherwise "option" or "switch"
-    greedy = None             # tracks the position/parameter of a greedy operand if seen
-    hidden = False            # once a hidden operand appears, subsequent operands must also be hidden
-    deprecated = False        # once a deprecated operand appears, subsequent operands must also be deprecated
-
-
-    def _resolve_spec(x):
-        """
-        Resolve a single default/item into a concrete spec (Operand/Option/Switch).
-
-        Contract
-        - Exactly one of the resolver hooks must be present and callable.
-        - The returned object must be an instance of the expected spec type.
-        """
-        if sum((
-            hasattr(x, "__operand__") and callable(x.__operand__),
-            hasattr(x, "__option__") and callable(x.__option__),
-            hasattr(x, "__switch__") and callable(x.__switch__)
-        )) != 1:
-            if isinstance(parameter, Parameter):
-                raise TypeError(f"{__name__} callback parameter {parameter.name!r} default must be argument-resoluble")
-            raise TypeError(f"{__name__} object at {_number(index)} position must be argument-resoluble")
-
-        if hasattr(x, "__operand__"):
-            operand = x.__operand__()
-            if not isinstance(operand, Operand):
-                raise TypeError("__operand__() non-operand returned")
-            return operand
-        elif hasattr(x, "__option__"):
-            option = x.__option__()
-            if not isinstance(option, Option):
-                raise TypeError("__option__() non-option returned")
-            return option
-        elif hasattr(x, "__switch__"):
-            switch = x.__switch__()
-            if not isinstance(switch, Switch):
-                raise TypeError("__switch__() non-switch returned")
-            return switch
+def _get_argument(x, ctx):
+    if sum((
+        hasattr(x, "__cardinal__") and callable(x.__cardinal__),
+        hasattr(x, "__option__") and callable(x.__option__),
+        hasattr(x, "__flag__") and callable(x.__flag__),
+    )) != 1:
+        if isinstance(ctx, str):
+            raise TypeError(f"parameter {ctx!r} default must be argument-resoluble")
+        raise TypeError(f"object at {ctx!r} position must be argument-resoluble")
+    if hasattr(x, "__cardinal__"):
+        argument = x.__cardinal__()
+        if not isinstance(argument, Cardinal):
+            raise TypeError("__cardinal__() non-cardinal return")
+    elif hasattr(x, "__option__"):
+        argument = x.__option__()
+        if not isinstance(argument, Option):
+            raise TypeError("__option__() non-option return")
+    elif hasattr(x, "__flag__"):
+        argument = x.__flag__()
+        if not isinstance(argument, Flag):
+            raise TypeError("__flag__() non-flag return")
+    else:
         raise RuntimeError("unreachable")
+    return argument
 
-    def _resolve_operand(operand):
-        """
-        Register an Operand, enforcing operand‑specific rules.
 
-        Enforced
-        - Handler: operand parameters must be positional‑only.
-        - Ordering: operands cannot appear after any qualifier was declared.
-        - Greedy: a greedy operand (nargs=Ellipsis) must be the last operand.
-        - Hidden/deprecated sequencing: once hidden/deprecated is seen, all following
-          operands must also be hidden/deprecated respectively.
-        """
+# Extract the arguments either from the callback signature or the iterable
+def _resolve_callback(cls, metadata):
+    __typename__ = re.sub(r"(?<!^)(?=[A-Z])", "-", cls.__name__).lower()
+    source = metadata.pop("source")
+
+    if not callable(source) and not isinstance(source, Iterable):
+        raise TypeError(f"{__typename__} first argument must be a callable or an iterable of argument-resoluble")
+
+    active = "cardinals"
+    greedy = False
+    hidden = False
+    deprecated = False
+
+    def _inject_cardinal(x, ctx):
         nonlocal active, greedy, hidden, deprecated
-        if isinstance(parameter, Parameter) and parameter.kind is not Parameter.POSITIONAL_ONLY:
-            raise TypeError(f"operand at parameter {parameter.name!r}, parameter must be positional-only")
-        if active != "operand":
-            raise TypeError(f"operand at {_number(index)} position cannot be defined after a {active}")
 
-        # Greedy (remainder) must be the last positional
-        if greedy:
-            if isinstance(greedy, Parameter):
-                raise TypeError(f"greedy operand at parameter {greedy.name!r} must be the last operand")
-            raise TypeError(f"greedy operand at {_number(greedy)} position must be the last operand")
-        greedy = parameter if operand.nargs is Ellipsis else None
-
-        # Visibility/deprecation sequencing
-        # Once a hidden/deprecated operand appears, forbid non-hidden/non-deprecated thereafter
-        hidden |= operand.hidden
-        if hidden and not operand.hidden:
-            if isinstance(parameter, Parameter):
-                raise TypeError(f"non-hidden operand at parameter {parameter.name!r} cannot follow a hidden one")
-            raise TypeError(f"non-hidden operand at {_number(index)} position cannot follow a hidden one")
-
-        deprecated |= operand.deprecated
-        if deprecated and not operand.deprecated:
-            if isinstance(parameter, Parameter):
-                raise TypeError(f"non-deprecated operand at parameter {parameter.name!r} cannot follow a deprecated one")
-            raise TypeError(f"non-deprecated operand at {_number(index)} position cannot follow a deprecated one")
-
-        # Indexing strategy:
-        # - Callable: index by parameter name.
-        # - Iterable: index by 1-based position.
-        if isinstance(parameter, Parameter):
-            operands[parameter.name] = operand
+        if callable(source):
+            if ctx.kind is not Parameter.POSITIONAL_ONLY:
+                raise TypeError(f"{__typename__} callback parameter {ctx.name!r} must be positional-only")
+            if greedy:
+                raise TypeError("cannot define more cardinals after a greedy one")
+            hidden |= x.hidden
+            if hidden and not x.hidden:
+                raise TypeError(f"non-hidden cardinal at {ctx.name!r} cannot follow a hidden one")
+            deprecated |= x.deprecated
+            if deprecated and not x.deprecated:
+                raise TypeError(f"non-deprecated cardinal at {ctx.name!r} cannot follow a deprecated one")
         else:
-            operands[index] = operand
+            if active != "cardinals":
+                raise TypeError(f"cardinal at {ctx!r} position cannot be followed by options and flags")
 
-    def _resolve_qualifier(qualifier):
-        """
-        Register an Option or Switch, enforcing qualifier‑specific shape and name constraints.
+        metadata["cardinals"][getattr(ctx, "name", ctx)] = x
+        metadata["styles"].setdefault(f"group-{x.group}", getattr(x.group, "style", None))
+        metadata["groups"][str(x.group)] += (x,)
 
-        Enforced
-        - Handler:
-          • Option params must be POSITIONAL_OR_KEYWORD (standard).
-          • Switch params must be KEYWORD_ONLY.
-        - Iterable:
-          • Options are not allowed to follow a switch when `active == "switch"`.
-        - Names:
-          • All aliases for the qualifier must be unique across previously seen qualifiers.
-        """
+    def _inject_switcher(x, ctx):
         nonlocal active
 
-        # Parameter shape constraints (callable source)
-        if isinstance(parameter, Parameter):
-            if isinstance(qualifier, Option) and parameter.kind is not Parameter.POSITIONAL_OR_KEYWORD:
-                raise TypeError(f"option at parameter {parameter.name!r}, parameter must be standard")
-            elif isinstance(qualifier, Switch) and parameter.kind is not Parameter.KEYWORD_ONLY:
-                raise TypeError(f"switch at parameter {parameter.name!r}, parameter must be keyword-only")
-
-        # Iterable ordering constraint: after a switch batch starts, no options can follow
-        if isinstance(qualifier, Option) and active == "switch":
-            raise TypeError(f"option at {_number(index)} position cannot follow a switch")
-
-        # Track which qualifier kind is currently active (affects iterable ordering)
-        active = "option" if isinstance(qualifier, Option) else "switch"
-
-        # Guard against alias collisions across all previously seen qualifiers
-        for name in qualifier.names & qualifiers.keys():
-            raise TypeError(f"{active} name {name!r} is already being used")
+        if callable(source):
+            if isinstance(x, Option) and ctx.kind is not Parameter.POSITIONAL_OR_KEYWORD:
+                raise TypeError(f"{__typename__} callback parameter {ctx.name!r} must be standard")
+            if isinstance(x, Flag) and ctx.kind is not Parameter.KEYWORD_ONLY:
+                raise TypeError(f"{__typename__} callback parameter {ctx.name!r} must be keyword-only")
         else:
-            qualifiers.update(dict.fromkeys(qualifier.names, qualifier))
+            if isinstance(x, Option) and active == "flags":
+                raise TypeError(f"option at {ctx!r} position cannot be followed by flags")
+        active = "options" if isinstance(x, Option) else "flags"
 
-    # Source: callable handler
+        for name in map(str, x.names):
+            if name in metadata["switchers"]:
+                raise TypeError(f"switcher {name!r} already defined")
+            metadata[active][name] = x
+        metadata["styles"].setdefault(f"group-{x.group}", getattr(x.group, "style", None))
+        metadata["groups"][str(x.group)] += (x,)
+
     if callable(source):
-        try:
-            source.signature = inspect.signature(source)
-            source.parameters = list(source.signature.parameters.values())
-        except ValueError:
-            raise TypeError(f"{__name__} callback must be callable with a signature") from None
-        except AttributeError:
-            raise TypeError(f"{__name__} callback must allow attribute assignments") from None
-
-        for parameter in source.parameters:
-            # For clarity/predictability we forbid *args/**kwargs in handlers
-            if parameter.kind in (Parameter.VAR_POSITIONAL, Parameter.VAR_KEYWORD):
-                raise TypeError(f"{__name__} callback parameter {parameter.name!r} cannot be variadic")
-            # Each parameter must have a default that is argument‑resoluble
+        parameters = source.__parameters__ = list(inspect.signature(source).parameters.values())
+        if metadata["methodize"]:
+            try:
+                parameter = parameters.pop(0)
+            except IndexError:
+                raise TypeError(f"methodize-ed {__typename__} callback must have at least one parameter") from None
+            if parameter.default is not Parameter.empty:
+                raise TypeError(f"methodize-ed {__typename__} callback first argument cannot have a default")
+            if parameter.name not in ("self", "this"):
+                raise TypeError(f"methodize-ed {__typename__} callback first argument must be named 'self' or 'this'")
+            if parameter.kind not in (Parameter.POSITIONAL_ONLY, Parameter.POSITIONAL_OR_KEYWORD):
+                raise TypeError(f"methodize-ed {__typename__} callback first argument must be positional")
+        for parameter in parameters:
             if parameter.default is Parameter.empty:
-                raise TypeError(f"{__name__} callback parameter {parameter.name!r} must have a default")
-
-            # Resolve and register
-            if isinstance(argument := _resolve_spec(parameter.default), Operand):
-                _resolve_operand(argument)
+                raise TypeError(f"{__typename__} callback parameter {parameter.name!r} must have a default")
+            if isinstance(argument := _get_argument(parameter.default, parameter.name), Cardinal):
+                _inject_cardinal(argument, parameter)
             else:
-                _resolve_qualifier(argument)
-            # Grouping index: record the spec under its group name (declaration order)
-            metadata["groups"][argument.group] += (argument,)
-
-
-    # Source: iterable of specs (schema‑only)
-    elif isinstance(source, Iterable):
-        for index, parameter in enumerate(source, start=1):
-            if isinstance(argument := _resolve_spec(parameter), Operand):
-                _resolve_operand(argument)
-            else:
-                _resolve_qualifier(argument)
-            # Grouping index: record the spec under its group name (declaration order)
-            metadata["groups"][argument.group] += (argument,)
-
-
-    # Invalid source
+                _inject_switcher(argument, parameter)
     else:
-        raise TypeError(f"{__name__} first argument must be a callable or an iterable of argument-resoluble")
-
-    return metadata.setdefault("callback", source if callable(source) else _dummy_callback)
-
-
-def _process_conflicts(cls, conflicts, metadata):
-    """
-    Internal: validate and normalize mutually exclusive group sets.
-
-    Purpose
-    - Read metadata["conflicts"] (iterable of iterables of group names), validate
-      shape and membership, and expand it into a symmetric lookup using the
-      provided `conflicts` mapping.
-
-    Expected input (user-facing)
-    - metadata["conflicts"]: iterable of iterables, where each inner iterable
-      denotes a set of groups that cannot co-exist, e.g.:
-        (("json", "yaml", "xml"), ("output", "dry-run"), ...)
-
-    Assumptions
-    - `conflicts` is an existing mapping with default frozenset values
-      (e.g., defaultdict(frozenset)). Values are re-bound with set unions:
-        conflicts[g] |= sanitized - {g}
-      to produce symmetric relationships (A→B implies B→A).
-
-    Validation rules
-    - The outer object and each inner object must be iterable.
-    - Group names must be str, trimmed to non-empty.
-    - Every referenced group must exist in metadata["groups"].
-    - Each conflict set must contain at least two distinct groups.
-    - Duplicates within an inner set are not allowed.
-
-    Output
-    - metadata["conflicts"] is set to the populated `conflicts` mapping containing
-      symmetric frozenset relationships for all declared conflicts.
-
-    Errors (concise, lowercased)
-    - TypeError when shape or types are invalid:
-        "{name} conflicts must be an iterable of iterables of strings"
-        "{name} conflicts must be an iterable of iterables of non-empty strings"
-        "group 'x' of {name} conflict is duplicated"
-        "group 'x' of {name} conflict is not declared"
-    - ValueError when a set has fewer than two distinct groups:
-        "{name} conflicts must be an iterable of iterables of at least two groups"
-    """
-    __name__ = re.sub(r"(?<!^)(?=[A-Z])", "-", cls.__name__).lower()
-
-    if not isinstance(metadata["conflicts"], Iterable):
-        raise TypeError(f"{__name__} conflicts must be an iterable of iterables of strings")
-
-    for groups in metadata["conflicts"]:
-        if not isinstance(groups, Iterable):
-            raise TypeError(f"{__name__} conflicts must be an iterable of iterables of strings")
-        sanitized = set()
-        for group in groups:
-            if not isinstance(group, str):
-                raise TypeError(f"{__name__} conflicts must be an iterable of iterables of strings")
-            elif not (group := group.strip()):
-                raise ValueError(f"{__name__} conflicts must be an iterable of iterables of non-empty strings")
-            if group in sanitized:
-                raise TypeError(f"group {group!r} of {__name__} conflict is duplicated")
-            sanitized.add(group)
-            if group not in metadata["groups"]:
-                raise TypeError(f"group {group!r} of {__name__} conflict is not declared")
-        if len(sanitized) < 2:
-            raise ValueError(f"{__name__} conflicts must be an iterable of iterables of at least two groups")
-        for group in sanitized:
-            conflicts[group] |= sanitized - {group}
-
-    metadata["conflicts"] = conflicts
+        if metadata["methodize"]:
+            raise TypeError(f"{__typename__} built from iterables cannot be methodize-ed")
+        for index, object in enumerate(source):
+            if isinstance(argument := _get_argument(object, index), Cardinal):
+                _inject_cardinal(argument, index)
+            else:
+                _inject_switcher(argument, index)
+    metadata["callback"] = source if callable(source) else _dummy_callback
 
 
-def _process_strings(cls, metadata):
-    __name__ = re.sub(r"(?<!^)(?=[A-Z])", "-", cls.__name__).lower()
+# Load all the metadata needed for help and version generations
+def _resolve_help_metadata(cls, metadata, defaults):
+    __typename__ = re.sub(r"(?<!^)(?=[A-Z])", "-", cls.__name__).lower()
+    callback = metadata["callback"]
 
     for name, object in map(lambda x: (x, metadata[x]), (
         "name",
         "descr",
+        "usage",
+        "build",
+        "epilog",
+        "version",
+        "license",
+        "homepage",
+        "copyright",
     )):
-        if object is not null and not isinstance(object, str):
-            raise TypeError(f"{__name__} {name!r} must be a string")
-        elif isinstance(object, str) and not (object := object.strip()):
-            raise TypeError(f"{__name__} {name!r} must be a non-empty string")
-        metadata[name] = null.nullify(object)
+        if object is not void and not isinstance(object, (str, Text)):
+            raise TypeError(f"{__typename__} {name!r} must be a string")
+        elif isinstance(object, (str, Text)) and not object:
+            raise ValueError(f"{__typename__} {name!r} must be a non-empty string")
+        metadata[name] = void.nullify(object, defaults.get(name))
 
 
-def _process_styles(cls, metadata):
-    __name__ = re.sub(r"(?<!^)(?=[A-Z])", "-", cls.__name__).lower()
+# Load the style for help and version generations
+def _resolve_styles(cls, metadata):
+    __typename__ = re.sub(r"(?<!^)(?=[A-Z])", "-", cls.__name__).lower()
 
-    styles = {}
     if not isinstance(metadata["styles"], Mapping):
-        raise TypeError(f"{__name__} 'styles' must be a mapping")
-    for tag, style in metadata["styles"].items():
-        if not isinstance(tag, str) or not isinstance(style, (str, Style)):
-            raise TypeError(f"{__name__} 'styles' must be a mapping of strings to styles")
-        styles[tag] = style
+        raise TypeError(f"{__typename__} styles must be a mapping of strings to strings or styles")
+    styles = {}
+    for name, style in metadata["styles"].items():
+        if not isinstance(name, str) or style is not None and not isinstance(style, (str, Style)):
+            raise TypeError(f"{__typename__} styles must be a mapping of strings to strings or styles")
+        styles[name] = style or None  # Remove empty styles
+    metadata["styles"] = styles
 
-    metadata["styles"] = getattr(metadata["parent"], "styles", {}) | styles
+
+# Load the conflicts groups
+def _resolve_groups(cls, metadata):
+    __typename__ = re.sub(r"(?<!^)(?=[A-Z])", "-", cls.__name__).lower()
+
+    message = f"{__typename__} 'conflicts' must be an iterable of iterables of conflicting groups"
+    if not isinstance(metadata["conflicts"], Iterable):
+        raise TypeError(message)
+    conflicts = defaultdict(frozenset)
+    for conflict in metadata["conflicts"]:
+        if not isinstance(conflict, Iterable):
+            raise TypeError(message)
+        try:
+            conflict = set(conflict)
+        except TypeError:
+            raise TypeError(message) from None
+        if len(conflict) < 2:
+            raise TypeError("conflicting groups must have at least two elements")
+        for group in conflict:
+            if not isinstance(group, str):
+                raise TypeError(message)
+            elif group not in metadata["groups"]:
+                raise TypeError(f"{__typename__} unknown group {group!r}")
+            conflicts[group] |= frozenset(conflict - {group})
+    metadata["conflicts"] = conflicts
+
+
+# Attach the new instance to the parent if apply
+def _attach_to_parent(metadata, child):
+    parent = metadata["parent"]
+    if parent is void:
+        metadata["parent"] = None
+        return  # Update the parent to expose None instead of void
+    if not isinstance(parent, Command):
+        raise TypeError(f"{child.__class__.__name__} parent must be any command")
+    if parent.cardinals:
+        raise TypeError(f"{child.__class__.__name__} parent must have no cardinals")
+    if parent._children.setdefault(str(child.name), child) is not child:  # NOQA: Owned Attribute
+        raise TypeError(f"parent delegated command {child.name!r} is duplicated")
 
 
 class Command:
+    """
+    A node in a command tree that parses tokens, runs argument callbacks, and optionally
+    dispatches to a handler. Can be used as the root command or as a subcommand.
+
+    Construction
+    - Via decorator (recommended for handler-backed commands):
+        @command(name="cli")        # top-level
+        def cli(file: str = Cardinal(), *, verbose: bool = Flag("-v", "--verbose")) -> None:
+            ...
+
+        @cli.command(name="sub")    # attach a child command to `cli`
+        def sub(count: int = Option("-n", "--count", type=int, default=1)) -> None:
+            ...
+    - Via iterable (no handler; returns parsed namespace when invoked):
+        cli = command([Cardinal(), Flag("-v", "--verbose")])
+        sub = cli.command([Option("-n", "--count", type=int, default=1)])
+
+    Behavior and features
+    - Argument model:
+        • Cardinal: positional argument specs (optionally greedy).
+        • Option: named options that accept values (supports nargs semantics).
+        • Flag: named switches without values.
+    - Helpers:
+        • -h/--help and -v/--version are injected if not provided.
+    - Rendering and UX:
+        • stderr/stdout properties expose Rich Consoles.
+        • trigger(...) integrates with warnings/errors for shell/non-shell flows (see triggers).
+        • lazy mode queues warnings/errors until parse finalization.
+        • shell, fancy, colorful, styles influence how issues and help are shown.
+    - Handler dispatch:
+        • For decorator-built commands, the handler signature defines arguments using default
+          values set to Cardinal/Option/Flag instances. The parser collects values and calls
+          the handler with properly shaped arguments.
+        • For iterable-built commands, no handler is attached; invoking returns a dict namespace.
+
+    Key properties
+    - parent: Command | None — parent node in the tree.
+    - children: Mapping[str, Command] — attached subcommands by name.
+    - cardinals/options/flags/switchers/groups/conflicts: read-only indices.
+    - styles: Mapping[str, str|Style] — named styles for rendering.
+    - lazy/shell/fancy/colorful/methodize: behavior flags.
+    - stderr/stdout: Rich consoles, cached per instance.
+    - patriarch: top-most ancestor in the tree (root).
+    - rootpath: tuple of Commands from root to self (root may be excluded elsewhere).
+    - namespace: deep copy of the last parsed mapping, or None.
+    - tokens: deep copy of remaining token deque captured during the last parse, or None.
+
+    Important methods
+    - command(...):
+        • Bound convenience wrapper for creating/attaching subcommands.
+        • Accepts either a callable (decorator/factory) or an iterable of specs.
+    - discover(module: str):
+        • Attach all top-level orphan Command instances from a module/globbed package path.
+    - trigger(x, **options):
+        • Emit a warning/error or aggregate exit; merges standard rendering options automatically.
+        • In shell mode, may show help before triggering.
+    - __invoke__(prompt=void):
+        • Parse and execute. Accepts:
+          — void (default): sys.argv[1:],
+          — str: tokenized with shlex.split,
+          — Iterable[str]: used as-is.
+        • Returns handler result or a namespace dict for iterable-defined commands.
+    - __replace__(**overrides):
+        • Clone this command with selected metadata overridden (e.g., parent, name, descr).
+        • Reuses the original handler or rebuilds from specs if no handler is attached.
+
+    Notes
+    - Only orphan commands can be attached to a parent; parentage is set during construction.
+    - Parent commands with cardinals cannot accept subcommands.
+    - Option explicit=True requires attached values (e.g., --opt=value).
+    - methodize=True lets handlers be written as instance-style callables (first arg self/this).
+    """
+
     __slots__ = (
+        "_children",
         "_callback",
         "_fallback",
-
-        "_children",
-
+        "_triggers",
         "_namespace",
-        "_pos",
+        "_tokens",
     )
 
     @property
-    def root(self):
+    @functools.cache
+    def stderr(self):
+        return Console(stderr=True)
+
+    @property
+    @functools.cache
+    def stdout(self):
+        return Console()
+
+    @property
+    @functools.cache
+    def patriarch(self):
         """
         Return the root command in this hierarchy.
 
         Behavior
         - Walks parent links to the top-most ancestor and returns it.
-        - Cost is linear in the depth of the hierarchy.
+        - Memoized per-instance.
 
         Notes
-        - The “root” is the command whose parent is None.
+        - Consider naming this 'root' or 'root_command' for clarity.
         """
         child, parent = self, self.parent
         while parent:
@@ -614,189 +548,907 @@ class Command:
     @property
     def rootpath(self):
         """
-        Return the path from the root command to this command (inclusive).
+        Return the ancestor path (as a list) excluding the root, ordered from closest ancestor down to self.
 
         Behavior
-        - Produces a tuple ordered from the root (first) down to this command (last).
-        - If this command is itself the root, the tuple contains just this command.
-
-        Implementation
-        - Uses a deque and appendleft to avoid building-and-reversing an intermediate list.
-          This keeps the operation strictly linear with small constant factors.
+        - The list is ordered from the nearest ancestor to this command down to this command itself.
+          The root (top-most ancestor whose parent is None) is excluded.
+        - If this command has no parent, returns an empty list.
+        - Memoized per-instance.
 
         Notes
-        - If you need the path without the root, slice: rootpath[1:].
-        - If you need the path without self, slice: rootpath[:-1].
+        - If you prefer a different ordering or inclusion:
+          • Include the root: append the final root after collection (before reversing), or compute separately.
+          • Order from self upward: return the list without reversing.
+          • Exclude self: start from `parent` instead of `self` when collecting.
         """
-        path = deque([command := self])
-        while command.parent:
-            path.appendleft(command := command.parent)
-        return tuple(path)
+        rootpath = []
+        command = self
+        while command:
+            rootpath.append(command)
+            command = command.parent
+        return tuple(reversed(rootpath))
+
+    @property
+    def namespace(self):
+        """
+        Return a deep copy of the last parsed namespace, or None if not available.
+        """
+        if self._namespace is void:  # type: ignore[attr-defined]
+            return
+        return copy.deepcopy(self._namespace)  # type: ignore[attr-defined]
+
+    @property
+    def tokens(self):
+        """
+        Return a deep copy of the remaining token deque captured during the last parse, or None if not available.
+        """
+        if self._tokens is void:  # type: ignore[attr-defined]
+            return
+        return copy.deepcopy(self._tokens)  # type: ignore[attr-defined]
 
     def __new__(
             cls,
             source,
             /,
-            parent=null,
-            name=os.path.basename(sys.argv[0]),
-            descr=null,
-            styles=null,
+            parent=void,
+            name=void,
+            descr=void,
+            usage=void,
+            build=void,
+            epilog=void,
+            version=void,
+            license=void,
+            homepage=void,
+            copyright=void,
+            styles={},  # NOQA: Sentinel not used
             conflicts=(),
             *,
-            shell=False,
-            fancy=False,
-            colorful=False,
-            deferred=False,
+            lazy=void,
+            shell=void,
+            fancy=void,
+            colorful=void,
+            methodize=False,
     ):
-        __name__ = re.sub(r"(?<!^)(?=[A-Z])", "-", cls.__name__).lower()
-        if parent is not null and not isinstance(parent, Command):
-            raise TypeError(f"{__name__} parent must be any-command")
-        elif getattr(parent, "operands", {}):
-            raise TypeError(f"{__name__} parent cannot have any operands")
-
         metadata = {
+            # Identity & hierarchy
+            "parent": parent,
             "name": name,
-            "descr": descr if descr is not null else ((inspect.getdoc(source) or null) if callable(source) else null),
-            "styles": null.nullify(styles, {}),
+            "descr": descr,
+
+            # Structure
+            "children": (children := {}),
             "groups": defaultdict(tuple),
             "conflicts": conflicts,
-            "operands": {},
-            "qualifiers": (qualifiers := {}),
-            "parent": null.nullify(parent),
-            "children": (children := {}),
-            "shell": bool(shell),
-            "fancy": bool(fancy),
-            "colorful": bool(colorful),
-            "deferred": bool(deferred),
+            "cardinals": {},
+            "switchers": ChainMap(options := {}, flags := {}),  # ease merging
+            "options": options,
+            "flags": flags,
+
+            # Appearance (exposed; frozen by _build_property)
+            "styles": styles,
+
+            # Behavior
+            "lazy": bool(void.nullify(lazy, getattr(parent, "lazy", False))),
+            "shell": bool(void.nullify(shell, getattr(parent, "shell", False))),
+            "fancy": bool(void.nullify(fancy, getattr(parent, "fancy", False))),
+            "colorful": bool(void.nullify(colorful, getattr(parent, "colorful", False))),
+            "methodize": bool(methodize),
+
+            # Volatile (kept last; popped/consumed later)
+            "source": getattr(source, "_callback", source),  # Due to the way to alias commands is stacking decorators
         }
-        callback = _get_callback(cls, source, metadata)
-        _process_conflicts(cls, defaultdict(frozenset), metadata)
+        _resolve_styles(cls, metadata)
+        _resolve_callback(cls, metadata)
+        _resolve_help_metadata(cls, metadata, {
+            "name": getattr(source, "__name__", os.path.basename(sys.argv[0])),
+            "descr": inspect.getdoc(source) if callable(source) else void,
+        })
+        _resolve_groups(cls, metadata)
+        _attach_to_parent(metadata, self := super().__new__(_cmdtype(cls, metadata)))
 
-        _process_strings(cls, metadata)
-        _process_styles(cls, metadata)
+        # Load default helpers
+        if not all(name in metadata["switchers"] for name in ("-h", "--help")):
+            help = flags["-h"] = flags["--help"] = Flag("-h", "--help", helper=True)
+            help.callback(self._show_help)
+        if not all(name in metadata["switchers"] for name in ("-v", "--version")):
+            version = flags["-v"] = flags["--version"] = Flag("-v", "--version", helper=True)
+            version.callback(self._show_version)
 
-        self = super().__new__(__type__(cls, metadata))
-
-        if not any(name in qualifiers for name in ("-h", "--help")):
-            # TODO: Insert help autogenerator
-            pass
-
-        if not any(name in qualifiers for name in ("-v", "--version")):
-            # TODO: Insert version autogenerator
-            pass
-
-        self._callback = callback
-        self._fallback = null
-
-        # Needs a mutable reference for future children attachment
+        # Volatiles
+        self._callback = metadata.pop("callback")
+        # Need mutability to attach
         self._children = children
-
-        if self.parent and self.parent._children.setdefault(self.name, self) is not self:  # NOQA: Owned Attribute
-            raise TypeError(f"{__name__} name {self.name!r} is already being used")
-
+        # Fallbacks
+        self._fallback = void
+        self._triggers = []
         # Runtimes
-        self._namespace = null
-        self._pos = null
+        self._namespace = void
+        self._tokens = void
+        return self
+
+    def _show_help(self):
+        console = (
+            self.stderr
+            if any(isinstance(trigger, CommandException) for trigger in self._triggers) else
+            self.stdout
+        )
+        console.print("NO HELP HERE")
+
+    def _show_version(self):
+        console = self.stdout
+        console.print("NO VERSION HERE")
+
+    def command(self, x=void, /, *args, **kwargs):
+        """
+        Create or decorate a subcommand with this command set as its parent.
+
+        This is a convenience wrapper around the top-level `command(...)` that pre-binds
+        `parent=self`, so you can define child commands close to where they belong.
+
+        Usage
+        - Decorator form (x is the default sentinel):
+            @self.command(name="child")
+            def run(...): ...
+          Returns a decorator that, when applied, builds and attaches the child Command.
+
+        - Factory form (x is provided):
+            child = self.command(x, name="child")
+          Immediately builds and attaches the child Command from a callable or an iterable of argument specs.
+
+        Parameters
+        - x: positional-only
+          • void (default) to obtain a decorator, or
+          • a callable (callback) or an iterable of argument specs to build a child Command directly.
+        - *args, **kwargs:
+          Forwarded unchanged to the top-level `command(x, parent=self, *args, **kwargs)`.
+
+        Returns
+        - In decorator form: a decorator that produces and attaches the child Command.
+        - In factory form: the constructed child Command.
+
+        Notes
+        - Only orphan commands can be attached; parent assignment happens during construction/
+          attachment and existing parents are not overridden.
+        - This helper does not accept an already-constructed Command instance as `x`;
+          pass a callable or an iterable of argument specs instead.
+        """
+        # Delegate to the global factory/decorator while pre-binding the parent to `self`.
+        return command(x, self, *args, **kwargs)
+
+    def discover(self, module, /):
+        """
+        Bind all top-level orphan Command instances from a module or modules.
+
+        Parameters
+        - module: str (positional-only)
+          • Exact dotted module path (e.g., "package.subpackage.commands"), or
+          • A glob pattern (e.g., "core.commands.*" or "core.commands.**") to match multiple modules.
+
+        Behavior
+        - Exact path: imports the target module and attaches orphan Command instances found at its top level.
+        - Glob path: imports the anchor package (prefix before the first glob char) and scans all submodules;
+          each module whose full dotted name matches the glob is imported and attached similarly.
+
+        Raises
+        - TypeError: if `module` is not a string.
+        - LookupError: if the target module cannot be imported, or for glob patterns if no matches are found.
+
+        Notes
+        - Matching uses fnmatch on full dotted module names, so '*' matches across dots.
+        - Only top-level attributes of each imported module are considered; no recursive attribute traversal.
+        - Already-parented commands are skipped; only orphans are attached.
+        """
+        # Validate argument
+        if not isinstance(module, str):
+            raise TypeError("bind argument must be a string")
+
+        # Detect glob usage
+        has_glob = any(ch in module for ch in "*?[]")
+
+        if not has_glob:
+            # Exact module import
+            try:
+                mod = __import__("importlib").import_module(module)
+            except ImportError:
+                raise LookupError(f"{type(self).__name__} unable to bind commands from module {module!r}") from None
+
+            for attr in dir(mod):
+                if isinstance(object := getattr(mod, attr), Command) and object.parent is None:
+                    copy.replace(object, parent=self)
+            return self
+
+        # Globbed import
+        importlib = __import__("importlib")
+        pkgutil = __import__("pkgutil")
+        fnmatch = __import__("fnmatch").fnmatch
+
+        # Find the non-glob anchor prefix (before first glob char)
+        first_glob = min((i for i in (module.find("*"), module.find("?"), module.find("[")) if i != -1), default=-1)
+        anchor = module[:first_glob].rstrip(".") or module  # fallback, though glob implies first_glob != -1
+
+        # Import the anchor package
+        try:
+            anchor_mod = importlib.import_module(anchor)
+        except ImportError:
+            raise LookupError(f"{type(self).__name__} unable to bind commands from pattern {module!r}: "
+                              f"anchor {anchor!r} cannot be imported") from None
+
+        # Ensure anchor is a package
+        if not hasattr(anchor_mod, "__path__"):
+            raise LookupError(f"{type(self).__name__} unable to bind commands from pattern {module!r}: "
+                              f"anchor {anchor!r} is not a package")
+
+        # Walk packages under anchor and collect matches
+        matched_any = False
+        for finder, name, ispkg in pkgutil.walk_packages(anchor_mod.__path__, prefix=anchor_mod.__name__ + "."):
+            if not fnmatch(name, module):
+                continue
+            matched_any = True
+            try:
+                mod = importlib.import_module(name)
+            except ImportError:
+                # Skip modules that fail to import; you may choose to accumulate and report if desired
+                continue
+            for attr in dir(mod):
+                if isinstance(object := getattr(mod, attr), Command) and object.parent is None:
+                    copy.replace(object, parent=self)
+
+        if not matched_any:
+            raise LookupError(f"{type(self).__name__} unable to bind commands from pattern {module!r}: no matches")
 
         return self
 
-    def command(self, source=null, /, *args, **kwargs):
-        # Return builder with the parent=self predefined
-        return command(source, self, *args, **kwargs)
+    def trigger(self, x, /, **options):
+        # Lazy mode: queue the trigger and merged options for later processing.
+        # Right operand of "|" wins, so built-ins (cmd, shell, styles, colorful) override user-provided ones.
+        if self.lazy:
+            self._triggers.append((x, options | {  # type: ignore[attr-defined]
+                "cmd": self,
+                "shell": self.shell,
+                "fancy": self.fancy,
+                "styles": self.styles,
+                "colorful": self.colorful
+            }))
 
-    def include(self, spec, /, inherit=False):
-        pass
+        # Fallback mode: invoke the fallback handler instead of triggering now.
+        # Note: current behavior does NOT pass options to the fallback; add if needed.
+        elif self._fallback is not void:  # type: ignore[attr-defined]
+            self._fallback(x)  # type: ignore[attr-defined]
 
-    def _sanitize_token(self, token):
-        match = re.fullmatch(r"(?P<input>--?[^\W\d_][^\W_]*(?:-?[^\W_]+)*)(?:=(?P<param>[^\r\n]*))?", token)
+        else:
+            # Interactive shell hint: show help first (still proceeds to trigger).
+            # If you intend to only show help and stop, add `return` after the call below.
+            if self.shell:
+                self.flags["--help"]()
 
+            # Immediate trigger: forward to the global trigger with merged options.
+            # Keys in this dict literal override entries from **options (desired precedence).
+            trigger(x, **{
+                **options,
+                "cmd": self,
+                "shell": self.shell,
+                "fancy": self.fancy,
+                "styles": self.styles,
+                "colorful": self.colorful
+            })
+
+    def _parse_switch(self, token):
+        # Strictly parse a switch token:
+        # - Names: "-x", "--long", "--long-name", case-insensitive, alnum with optional dashes.
+        # - Optional inline parameter with "=" (captures even empty string to detect misuse).
+        match = re.fullmatch(r"(?P<input>--?[A-Z](?:-?[A-Z0-9]+)*)(?:=(?P<param>(?s:.)*))?", token, IGNORECASE)
+
+        # If the token does not match the expected syntax, emit a format error and abort parsing this token.
         if not match:
-            # TODO: Add error handling
-            raise SkipToken
+            self.trigger(InvalidFormatError(
+                f"invalid option or flag format: {token!r}",
+                token,
+                hint="ensure the option or flag follows the expected syntax, including any required prefix or separator"
+            ))
+            raise SentinelException
 
-        input, param = match["input"], match["param"]
+        # Unpack the switch name and the (possibly None or empty) inline parameter.
+        input, param = match.groupdict().values()
 
-        if input not in self.qualifiers:
-            # TODO: Add error handling
-            raise SkipToken
+        # Unknown switch name: try to suggest close matches using the full alias set; then abort.
+        if input not in self.switchers:
+            suggestions = difflib.get_close_matches(input, self.switchers.keys(), 5)
+            try:
+                hint = f"did you mean: {suggestions.pop(0)!r}?"
+            except IndexError:
+                hint = "check the spelling or run --help to see available options"
+            self.trigger(UnrecognizedOptionError(
+                f"unrecognized option or flag: {input!r}",
+                input,
+                hint=hint,
+            ))
+            raise SentinelException
 
-        if isinstance(param, str):
-            qualifier = self.qualifiers[input]
-            if isinstance(qualifier, Option) and not param:
-                # TODO: Add warning handling
-                pass  # recommended to add explicit parameters if "=", but do not leave empty
-            elif isinstance(qualifier, Switch) and param:
-                # TODO: Add error handling
-                pass
+        # Inline "=" present but with an empty value:
+        # - For flags, parameters are not allowed → instruct to remove "=...".
+        # - For options, an empty value is invalid → instruct how to provide it properly.
+        if isinstance(param, str) and not param:
+            if isinstance(self.switchers[input], Flag):  # subclasses ok
+                message = f"flag does not take a parameter: {input!r}"
+                hint = "remove '=parameter' from the flag usage"
+            else:  # Option (or any subclass that takes parameters)
+                message = f"empty parameter for option: {input!r}"
+                hint = "provide a parameter after '=' or omit '=' to pass the parameter as the next token"
+            self.trigger(ParameterWrongUsageError(
+                message,
+                self.switchers[input],
+                input,
+                hint=hint,
+            ))
 
+        # Valid switch; return the canonical name and its inline parameter (or None).
         return input, param
 
-    def _parse(self, tokens, pos=1):
-        assert self._namespace is null and self._pos is null
-        self._namespace = {}
-        self._pos = pos
+    def _getparams(self, tokens, input, argument, *, offset):
+        kind = "option" if isinstance(argument, Option) else "flag"
+        if getattr(argument, "greedy", False):
+            result = []
+            while tokens:
+                result.append(tokens.popleft())
+        else:
+            peekable = lambda: tokens and not tokens[0].startswith("-")
+            nargs = argument.nargs
+            if not nargs or nargs == "?":
+                if not nargs:
+                    self.trigger(MissingParameterError(
+                        f"missing required parameter for {input!r} {kind}",
+                        input,
+                        expected_min=1, got=0,
+                        hint="provide the parameter after the option or as the next token",
+                        offset=offset,
+                    ))
+                result = tokens.popleft() if peekable() else void
+            elif nargs in ("*", "+"):
+                result = []
+                while peekable():
+                    result.append(tokens.popleft())
+                if nargs == "+" and not result:
+                    self.trigger(MissingParameterError(
+                        f"missing required parameter for {input!r} {kind}",
+                        input,
+                        expected_min=1, got=0,
+                        hint="provide at least one parameter",
+                        offset=offset,
+                    ))
+            else:
+                result = []
+                while peekable() and len(result) < nargs:
+                    result.append(tokens.popleft())
+                if len(result) != nargs:
+                    self.trigger(ArityMismatchError(
+                        f"expected {nargs} parameter{'s' if nargs != 1 else ''} for {input!r} {kind}, "
+                        f"got {len(result)}",
+                        input,
+                        expected=nargs, got=len(result),  # type: ignore[misc]
+                        hint="check the number of parameters provided",
+                        offset=offset,
+                    ))
 
-        operands = deque(self.operands)
-        tried = False
-        while tokens:
-            token = tokens.popleft()
-
-            # Greedy operands match everything regardless if it is an option or no
-            if token.startswith("-") and not (operands and self.operands[operands[0]].nargs is Ellipsis):
+        if isinstance(result, list):
+            for index, string in enumerate(result):
                 try:
-                    input, param = self._sanitize_token(token)
-                except SkipToken:
+                    with catch_warnings(record=True) as warnings:
+                        result[index] = argument.type(string)
+                    for warning in warnings:
+                        if isinstance(warning, CommandWarning):
+                            self.trigger(warning)
+                        else:
+                            self.trigger(ParameterCoercionWarning(
+                                str(getattr(warning, "message", warning)),
+                                input,
+                                string,
+                                hint="verify the interpreted parameter",
+                            ))
+                except CommandException as exception:
+                    self.trigger(exception)
+                except Exception as exception:  # NOQA
+                    self.trigger(ParameterConversionError(
+                        f"invalid parameter for {input!r} {kind}: {string!r}",
+                        input,
+                        string,
+                        hint="check the expected type and format",
+                        offset=offset,
+                    ))
+        else:
+            try:
+                with catch_warnings(record=True) as warnings:
+                    result = argument.type(result)
+                for warning in warnings:
+                    if isinstance(warning, CommandWarning):
+                        self.trigger(warning)
+                    else:
+                        self.trigger(ParameterCoercionWarning(
+                            str(getattr(warning, "message", warning)),
+                            input,
+                            result if isinstance(result, str) else str(result),
+                            hint="verify the interpreted value",
+                        ))
+            except CommandException as exception:
+                self.trigger(exception)
+            except Exception as exception:  # NOQA
+                self.trigger(ParameterConversionError(
+                    f"invalid value for {input!r} {kind}: {result!r} ",
+                    input,
+                    result,
+                    hint="check the expected type and format",
+                    offset=offset,
+                ))
+
+        return result
+
+    def _finalize(self, *, helper=False):
+        # If nothing was enqueued during parsing, there’s nothing to do.
+        if not self._triggers:
+            return
+
+        # If a fallback handler was registered, delegate all collected triggers
+        # (warnings/exceptions) to it and stop here.
+        if self._fallback is not void:
+            self._fallback(self._triggers)
+            return
+
+        # Partition all collected triggerables into:
+        # - warnings: list of (CommandWarning, options)
+        # - exceptions: list[CommandException]
+        # - specifics: mapping CommandException -> options
+        warnings, exceptions, specifics = [], [], {}
+        for triggerable, options in self._triggers:
+            options = options or {}
+            if isinstance(triggerable, CommandWarning):
+                warnings.append((triggerable, options))
+            elif isinstance(triggerable, CommandException):
+                exceptions.append(triggerable)
+                specifics[triggerable] = options
+
+        # Emit all warnings first (non-fatal). Each keeps its own options.
+        for warning, options in warnings:
+            trigger(warning, **options)
+
+        try:
+            # Aggregate any exceptions into a CommandExit.
+            # If there are no exceptions, CommandExit(...) should raise ValueError
+            # (caught below), which we treat as "nothing to exit for".
+            exit = CommandExit("bad exit", exceptions)
+
+            # In interactive shell mode, optionally show help once before exiting.
+            # The 'helper' flag prevents printing help twice when the help flag
+            # itself triggered this finalizer.
+            if self.shell and not helper:
+                self.flags.get("--help", self._show_help)()
+
+            # Finally, trigger the aggregated exit with the standard rendering options
+            # and the 'specifics' mapping so the printer can render per-exception details.
+            trigger(
+                exit,
+                cmd=self, shell=self.shell, fancy=self.fancy, styles=self.styles, colorful=self.colorful,
+                specifics=specifics,
+            )
+        except ValueError:
+            # No exceptions → nothing to exit for.
+            pass
+
+    def _parse(self, tokens, *, triggers=()):
+        self._triggers[::] = triggers  # Clean old triggers if any
+
+        assert self._namespace is void and self._tokens is void, "illegal state"
+        self._namespace = dict()
+        self._tokens = tokens
+
+        number = lambda number: {
+            1: "first",
+            2: "second",
+            3: "third",
+            4: "fourth",
+            5: "fifth",
+            6: "sixth",
+            7: "seventh",
+            8: "eighth",
+            9: "ninth",
+            10: "tenth",
+        }.get(number, f"{number}th")
+
+        groups = set()
+        called = set()
+
+        remaining = lambda: cardinals and self.cardinals[cardinals[0]].greedy
+        cardinals = deque(self.cardinals.keys())
+        offset = 0
+        index = 0
+        runt = False
+
+        while self._tokens:
+            token = self._tokens.popleft()
+
+            if token.startswith("-") and not remaining():
+                try:
+                    input, param = self._parse_switch(token)
+                except SentinelException:
                     continue
-            elif self.children and not tried:
+                argument = self.switchers[input]
+            elif not self._namespace and self.children and not runt:
                 try:
-                    return self.children[token]._parse(tokens, pos)  # NOQA: Owned Attribute
+                    return self.children[token]._parse(tokens, triggers=self._triggers)  # NOQA: Owned Attribute
                 except KeyError:
-                    # TODO: Add error handling
-                    tried = True
-                break
+                    suggestions = difflib.get_close_matches(token, list(self.children.keys()), n=5, cutoff=0.6)
+                    kind = "command" if self.parent is None else "subcommand"
+                    hint = (
+                        f"did you mean {suggestions[0]!r}?"
+                        if suggestions
+                        else ("run --help to see available commands" if self.parent is None
+                              else "run --help to see available subcommands")
+                    )
+                    self.trigger(UnknownCommandError(
+                        f"unrecognized {kind}: {token!r}",
+                        token,
+                        hint=hint,
+                    ))
+                runt = True
+                continue
             else:
                 try:
-                    argument = self.operands[input := operands.popleft()]
-                    param = null
+                    argument = self.cardinals[input := cardinals.popleft()]
+                    param = void
+                    index += 1
                 except IndexError:
-                    # TODO: Add error handling
+                    offset += 1
+                    self.trigger(UnexpectedPositionalArgumentError(
+                        f"unexpected positional argument: {token!r} at {number(offset)} position",
+                        offset,
+                        hint="remove the extra argument or run --help to see expected positionals",
+                    ))
                     continue
-                tokens.appendleft(token)
+                self._tokens.appendleft(token)
 
-        if self._callback is null:
-            return self._namespace
-        self(*args, **kwargs)  # NOQA: Dynamically Injected
+            # Deprecated
+            if argument.deprecated and not argument.hidden:
+                if isinstance(argument, Cardinal):
+                    kind = "positional argument"
+                elif isinstance(argument, Option):
+                    kind = "option"
+                else:
+                    kind = "flag"
+                self.trigger(DeprecatedArgumentWarning(
+                    f"usage of {input!r} at {number(offset + 1)} position is deprecated",
+                    argument,
+                    hint=f"remove the {kind} or run --help to see available {kind}s",
+                ))
 
-    def __invoke__(self, prompt=null, /):
-        if prompt is null:
+            # Conflicting group
+            if conflicts := self.conflicts[group := str(argument.group)] & groups:
+                self.trigger(GroupConflictError(
+                    f"conflicting argument group: {group!r}",
+                    group,
+                    hint=f"remove one of: {', '.join(sorted(map(str, conflicts | {group})))}",
+                ))
+            groups.add(group)
+
+            # Already parsed
+            if input in self._namespace:
+                self.trigger(DuplicateArgumentError(
+                    f"duplicate argument (or an alias): {input!r}",
+                    input,
+                    hint="specify the argument only once",
+                ))
+
+            # Argument must be the first parsed (no namespace)
+            if getattr(argument, "standalone", False):
+                if isinstance(argument, Option):
+                    kind = "option"
+                else:
+                    kind = "flag"
+                if self._namespace or any(self._tokens[index].startswith("-") for index in range(1, len(self._tokens))):
+                    self.trigger(StandaloneUsageError(
+                        f"{kind} {input!r} should be specified alone",
+                        input,
+                        hint="invoke it without other arguments",
+                    ))
+
+            if isinstance(argument, Flag):
+                self._namespace |= dict.fromkeys(map(str, argument.names), True)
+            elif isinstance(argument, Option):
+                if argument.explicit and not param:
+                    self.trigger(ParameterWrongUsageError(
+                        f"missing required inline parameter for option: {input!r}",
+                        argument,
+                        input,
+                        hint="use '--name=parameter' (inline) rather than spacing the parameter",
+                    ))
+                self._namespace |= dict.fromkeys(map(str, argument.names), self._getparams(
+                    deque(param.split(",")) if param else self._tokens,
+                    input,
+                    argument,
+                    offset=offset
+                ))
+            else:
+                self._namespace[input] = self._getparams(
+                    self._tokens,
+                    index,
+                    argument,
+                    offset=offset
+                )
+
+            if (not hasattr(argument, "nargs")
+                    or (not argument.nargs or argument.nargs == "?")
+                    and not getattr(argument, "greedy", False)):
+                offset += 1
+            else:
+                offset += len(self._namespace[input])
+
+            if argument.nowait and argument not in called:
+                if isinstance(argument, Flag):
+                    argument()
+                elif (not argument.nargs or argument.nargs == "?") and not getattr(argument, "greedy", False):
+                    argument(self._namespace[input])
+                elif not isinstance(argument.nargs, int) or len(self._namespace[input]) == argument.nargs:
+                    argument(*self._namespace[input])  # To avoid the type error of missing arguments
+
+                if getattr(argument, "terminator", False):
+                    self._finalize(helper="--help" in map(str, getattr(argument, "names", ())))
+                    if self.shell:
+                        sys.exit(0)
+                    self._namespace = void
+                    self._tokens = void
+                    return
+
+                called.add(argument)
+
+        # Unparsed arguments
+        if self._tokens:
+            leftover = tuple(self._tokens)
+            self.trigger(UnparsedTokensError(
+                f"unparsed {'argument' if len(leftover) == 1 else 'arguments'}: "
+                f"{', '.join(map(repr, leftover))}",
+                leftover,
+                hint="remove extra arguments or check your syntax with --help",
+            ))
+
+        arguments = {}
+        arguments.update(self.cardinals)
+        arguments.update((str(switcher.names[0]), switcher) for switcher in set(self.switchers.values()))
+
+        # Complete the no handled yet if any
+        for input, argument in arguments.items():
+            if argument in called or input not in self._namespace:
+                continue
+            if isinstance(argument, Flag):
+                argument()
+            elif (not argument.nargs or argument.nargs == "?") and not getattr(argument, "greedy", False):
+                argument(self._namespace[input])
+            elif not isinstance(argument.nargs, int) or len(self._namespace[input]) == argument.nargs:
+                argument(*self._namespace[input])  # To avoid the type error of missing arguments
+
+        while cardinals:
+            # Get the next cardinal and its nargs in one shot
+            nargs = (cardinal := self.cardinals[input := cardinals.popleft()]).nargs
+
+            # Required if: not greedy, and (nargs is None, "+", or an int)
+            if not cardinal.greedy and (not nargs or nargs == "+" or isinstance(nargs, int)):
+                self.trigger(MissingArgumentError(
+                    f"missing required positional argument: {input!r}",
+                    input,
+                    hint="run --help to see expected positionals",
+                ))
+            self._namespace[input] = cardinal.default
+
+        # Before retrieve the result sanitized, all pending triggers must be processed
+        # Non-lazy or no-errored commands this statement has no effect
+        self._finalize()
+
+        if self._callback is _dummy_callback:
+            for option in self.options.values():
+                for name in map(str, option.names):
+                    self._namespace.setdefault(name, option.default)
+            for flag in self.flags.values():
+                for name in map(str, flag.names):
+                    self._namespace.setdefault(name, False)
+            namespace, self._namespace = self._namespace, void
+            self._tokens = void
+            return {key: void.nullify(value) for key, value in namespace.items()}
+
+        args, kwargs = (), {}
+        for parameter in self._callback.__parameters__:
+            argument = parameter.default
+            if parameter.kind is not Parameter.KEYWORD_ONLY:
+                args += (void.nullify(self._namespace.get(
+                    str(getattr(argument, "names", (parameter.name,))[0]), argument.default
+                )),)
+            else:
+                kwargs[parameter.name] = self._namespace.get(str(argument.names[0]), False)
+
+        self._namespace = void
+        self._tokens = void
+        if self.methodize:
+            self(self, *args, **kwargs)  # NOQA: Call Dynamically Injected
+        else:
+            self(*args, **kwargs)  # NOQA: Call Dynamically Injected
+
+    def __invoke__(self, prompt=void, /):
+        """
+        Parse and execute this command.
+
+        Parameters
+        - prompt: positional-only
+          • void (default): use process arguments (sys.argv[1:]).
+          • str: split with shlex.split(prompt).
+          • iterable[str]: tokens are taken as-is.
+          Any other type, or any iterable containing non-str items, raises TypeError.
+
+        Returns
+        - The result of self._parse(...), which typically is:
+          • The produced namespace (dict) when no handler/callback is attached, or
+          • The callback’s return value if a handler is attached.
+
+        Notes
+        - This method is the primary entry point for running a command.
+        - Tokenization via shlex.split honors shell-like quoting rules.
+        """
+        if prompt is void:
             tokens = sys.argv[1:]
         elif isinstance(prompt, str):
             tokens = shlex.split(prompt)
-        elif isinstance(prompt, Iterable):
-            tokens = list(prompt)
-            if any(not isinstance(token, str) for token in tokens):
-                raise TypeError(f"__invoke__() argument must be a string or an iterable of strings")
         else:
-            raise TypeError(f"__invoke__() argument must be a string or an iterable of strings")
-        return self._parse(deque(tokens))
+            try:
+                tokens = list(prompt)
+            except TypeError:
+                raise TypeError("invoke argument must be a string or an iterable of strings") from None
+            if any(not isinstance(token, str) for token in tokens):
+                raise TypeError("invoke argument must be a string or an iterable of strings") from None
+
+        # Delegate to the parser. If no handler is attached, this yields the namespace;
+        # otherwise it triggers the callback and returns its result.
+        return self._parse(deque(tokens))  # type: ignore[attr-defined]
+
+    def __replace__(self, **overrides):
+        """
+        Return a new Command cloned from this one, overriding selected metadata.
+
+        Source selection
+        - If this command was created from a callback, reuse that callback.
+        - If it was created from argument specs (and thus uses the internal _dummy_callback),
+          rebuild from the current specs (cardinals, options, flags).
+
+        Supported overrides (keyword-only)
+        - parent, name, descr, styles, conflicts, lazy, shell, fancy, colorful, methodize
+
+        Notes
+        - descr preserves “unset” semantics by passing the internal sentinel when None.
+        - conflicts expects an iterable of iterables; the current mapping is converted accordingly.
+        - Unknown override names raise TypeError.
+        """
+        # Decide which source to reuse: the real callback or the current specs
+        try:
+            is_dummy = (self._callback is _dummy_callback)  # type: ignore[attr-defined]
+        except NameError:
+            # Fallback if symbol not visible (shouldn't happen if defined in this module)
+            is_dummy = False
+        seen = set()
+        src = (
+                list(self.cardinals.values()) +
+                list(option for option in self.options.values() if seen.add(option) or option not in seen) +
+                list(flag for flag in self.flags.values() if seen.add(flag) or flag not in seen)
+        ) if is_dummy else self._callback  # type: ignore[attr-defined]
+
+        # Build constructor kwargs from current values unless overridden
+        kwargs = {
+            "parent": overrides.pop("parent", self.parent),
+            "name": overrides.pop("name", self.name),
+            "descr": overrides.pop("descr", self.descr if self.descr is not None else void),
+            "styles": overrides.pop("styles", self.styles),
+            "conflicts": overrides.pop("conflicts", tuple(self.conflicts.values())),
+            "lazy": overrides.pop("lazy", self.lazy),
+            "shell": overrides.pop("shell", self.shell),
+            "fancy": overrides.pop("fancy", self.fancy),
+            "colorful": overrides.pop("colorful", self.colorful),
+            "methodize": overrides.pop("methodize", self.methodize),
+        }
+
+        if overrides:
+            unknown = ", ".join(sorted(overrides.keys()))
+            raise TypeError(f"__replace__() got unexpected keyword(s): {unknown}")
+
+        if type(self).__bases__ == (Command, *Command.__bases__):
+            return Command(src, **kwargs)
+        return type(self)(src, **kwargs)
 
 
-@functools.wraps(Command, ["__type_params__"])
-def command(source=null, *args, **kwargs):
-    # Yeah, I know, even if it looks weird, from iterables builds allow this:
-    # command([...]).command([...]).command([...]).command([...]).command([...]).command([...])
-    decorating = source is null
+def command(x=void, /, *args, **kwargs):
+    """
+    Decorator/factory for building a Command.
+
+    Usage patterns
+    - As a decorator:
+        @command(...)
+        def main(...) -> None: ...
+      In this form, `x` is the function being decorated.
+
+    - As a factory with a source (iterable of argument specs or a callable):
+        cmd = command(source, ...)
+      Here `x` is the source used to construct the Command.
+
+    Parameters
+    - x: positional-only. Either:
+        • void (default) when used as a decorator, or
+        • a source (callable or iterable of specs) to be wrapped into a Command.
+    - *args, **kwargs: forwarded to Command(...) as-is.
+
+    Returns
+    - When used as a decorator (x is void): a decorator function that, when applied,
+      returns a Command instance built from the decorated object.
+    - When used as a factory (x is not void): a Command instance.
+
+    Errors
+    - Raises TypeError if used as a decorator but applied to a non-callable.
+    """
+    # When x is void we are returning a decorator; otherwise we directly construct Command.
+    # This prevents the ambiguous pattern command(...)(<iterable>) by requiring command(<iterable>, ...).
+    decorating = x is void  # Force usage of `command(<iterable>, ...)` instead of `command(...)(<iterable>)`
 
     @_update_name("command")
-    def decorator(source, /):
-        if decorating and not callable(source):  # Enforces `command([...], ...)` instead of `command(...)([...])`
-            raise TypeError("@command() must be wrapping a callable")
-        return Command(source, *args, **kwargs)
+    def decorator(x):
+        # If used as a decorator, ensure the decorated target is callable.
+        if decorating and not callable(x):
+            raise TypeError("@command() must be applied to a callable")
+        # Construct and return the Command. All extra args/kwargs are passed through.
+        return Command(x, *args, **kwargs)
 
-    return decorator(source) if source is not null else decorator
+    # If x is provided, build immediately; otherwise return the decorator to be applied later.
+    return decorator(x) if x is not void else decorator
+
+
+def invoke(x, prompt=void, /):
+    """
+    Execute an invocable command or wrap-and-invoke a source.
+
+    Primary path
+    - If `x` implements __invoke__, call that with the provided `prompt`.
+      If `x` is a child command, its 'patriarch' is invoked instead (children cannot be given).
+
+    Permissive fallback
+    - If `x` does not implement __invoke__, attempt to wrap it with command(x) and
+      then invoke the resulting Command. This is a convenience path; explicit usage
+      (invoke(command(x), prompt)) is preferred for clarity.
+
+    Parameters
+    - x: positional-only. Either an object that implements __invoke__, or a callable/iterable
+         that can be wrapped into a Command.
+    - prompt: positional-only. Prompt/context passed through to __invoke__.
+
+    Returns
+    - The result of the underlying __invoke__ call.
+
+    Errors
+    - If `x` neither implements __invoke__ nor qualifies for the permissive wrapping,
+      a TypeError is raised. A second, more specific TypeError is raised when the
+      permissive fallback fails binding.
+    """
+    # Direct invocation path: allow objects with __invoke__ (e.g., Command instances).
+    if hasattr(x, "__invoke__"):
+        # If `x` has a 'patriarch' (root command), invoke that instead of a child.
+        return getattr(x, "patriarch", x).__invoke__(prompt)  # children cannot be given
+
+    # Permissive fallback: attempt to wrap a callable or an iterable of specs into a Command.
+    # Note: this branch requires BOTH "callable(x)" AND "isinstance(x, Iterable)" to be true
+    # to proceed; otherwise we raise. If you intended "callable OR iterable", adjust the check.
+    # Prefer explicit usage: invoke(command(x), prompt)
+    if not callable(x) or not isinstance(x, Iterable):
+        raise TypeError("invoke() first argument must implement __invoke__ method") from None
+
+    try:
+        # Wrap then recurse into the primary path.
+        return invoke(command(x), prompt)
+    except TypeError:
+        # If wrapping fails (e.g., due to incompatible source), surface a clearer error.
+        raise TypeError("invoke() permissive fallback bad argument") from None
 
 
 __all__ = (
     "Command",
-    "command"
+    "command",
+    "invoke"
 )
