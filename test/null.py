@@ -17,7 +17,7 @@ from unittest import TestCase
 from rich.console import Console
 from rich.text import Text
 
-from argonaut.null import *
+from argonaut.internals import *
 
 
 class NullTest(TestCase):
@@ -163,5 +163,5 @@ class NullTest(TestCase):
 
 
 if __name__ == '__main__':
-    # Allow running this test module directly: `python -m pytest` or `python null.py`.
+    # Allow running this test module directly: `python -m pytest` or `python internals.py`.
     unittest.main()
