@@ -28,8 +28,9 @@ class Command(metaclass=CommandType):
     conflicts: Mapping[str, Set[str]]
     parent: Command | None
     children: Mapping[str, Command]
-    shell: bool
     fancy: bool
+    shell: bool
+    colorful: bool
     deferred: bool
     @property
     def root(self) -> Command: ...
@@ -46,9 +47,11 @@ class Command(metaclass=CommandType):
             name: str = ...,
             descr: str = ...,
             usage: str = ...,
+            conflicts: Iterable[Iterable[str]] = ...,
             *,
             fancy: bool = ...,
             shell: bool = ...,
+            colorful: bool = ...,
             deferred: bool = ...,
     ) -> Command: ...
     @overload
@@ -60,9 +63,11 @@ class Command(metaclass=CommandType):
             name: str = ...,
             descr: str = ...,
             usage: str = ...,
+            conflicts: Iterable[Iterable[str]] = ...,
             *,
             fancy: bool = ...,
             shell: bool = ...,
+            colorful: bool = ...,
             deferred: bool = ...,
     ) -> Command: ...
     @overload
@@ -74,9 +79,11 @@ class Command(metaclass=CommandType):
             name: str = ...,
             descr: str = ...,
             usage: str = ...,
+            conflicts: Iterable[Iterable[str]] = ...,
             *,
             fancy: bool = ...,
             shell: bool = ...,
+            colorful: bool = ...,
             deferred: bool = ...,
     ) -> Command: ...
     def fallback(self, fallback: Callable[..., Any]) -> Any: ...
@@ -88,9 +95,11 @@ class Command(metaclass=CommandType):
             name: str = ...,
             descr: str = ...,
             usage: str = ...,
+            conflicts: Iterable[Iterable[str]] = ...,
             *,
             fancy: bool = ...,
             shell: bool = ...,
+            colorful: bool = ...,
             deferred: bool = ...,
     ) -> Command: ...
     @overload
@@ -101,9 +110,11 @@ class Command(metaclass=CommandType):
             name: str = ...,
             descr: str = ...,
             usage: str = ...,
+            conflicts: Iterable[Iterable[str]] = ...,
             *,
             fancy: bool = ...,
             shell: bool = ...,
+            colorful: bool = ...,
             deferred: bool = ...,
     ) -> Command: ...
     @overload
@@ -114,9 +125,11 @@ class Command(metaclass=CommandType):
             name: str = ...,
             descr: str = ...,
             usage: str = ...,
+            conflicts: Iterable[Iterable[str]] = ...,
             *,
             fancy: bool = ...,
             shell: bool = ...,
+            colorful: bool = ...,
             deferred: bool = ...,
     ) -> Command: ...
     def include(self, source: str, /) -> None: ...
@@ -135,9 +148,11 @@ def command(
         name: str = ...,
         descr: str = ...,
         usage: str = ...,
+        conflicts: Iterable[Iterable[str]] = ...,
         *,
         fancy: bool = ...,
         shell: bool = ...,
+        colorful: bool = ...,
         deferred: bool = ...,
 ) -> Command: ...
 @overload
@@ -148,9 +163,11 @@ def command(
         name: str = ...,
         descr: str = ...,
         usage: str = ...,
+        conflicts: Iterable[Iterable[str]] = ...,
         *,
         fancy: bool = ...,
         shell: bool = ...,
+        colorful: bool = ...,
         deferred: bool = ...,
 ) -> Command: ...
 @overload
@@ -161,9 +178,11 @@ def command(
         name: str = ...,
         descr: str = ...,
         usage: str = ...,
+        conflicts: Iterable[Iterable[str]] = ...,
         *,
         fancy: bool = ...,
         shell: bool = ...,
+        colorful: bool = ...,
         deferred: bool = ...,
 ) -> Command: ...
 @overload
@@ -173,8 +192,10 @@ def command(
         name: str = ...,
         descr: str = ...,
         usage: str = ...,
+        conflicts: Iterable[Iterable[str]] = ...,
         fancy: bool = ...,
         shell: bool = ...,
+        colorful: bool = ...,
         deferred: bool = ...,
 ) -> Callable[[Callable[..., Any]], Command]: ...
 

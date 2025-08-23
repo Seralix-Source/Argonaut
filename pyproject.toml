@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=69.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "argonaut"
+version = "0.8.0"
+description = "Composable command trees with friendly parsing, faults, and rich shell-mode UX."
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [
+    { name = "Eiko Reishin (影皇嶺臣)" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "rich>=13.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/Seralix-Source/Argonaut"
+
+[tool.setuptools.packages.find]
+include = ["argonaut*"]
+
+[tool.setuptools.package-data]
+argonaut = ["*.pyi"]

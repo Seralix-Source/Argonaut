@@ -5,6 +5,7 @@
       <w>appendleft</w>
       <w>arities</w>
       <w>cmdtype</w>
+      <w>dedented</w>
       <w>defaultdict</w>
       <w>globbed</w>
       <w>ispkg</w>

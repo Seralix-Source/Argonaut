@@ -490,6 +490,9 @@ def _process_variadic_metadata(cls, metavar, type, nargs, default, choices):
             unique.append(choice)
         choices = tuple(unique)
 
+    if metavar and choices:
+        warnings.warn(f"{typename} with metavar and choices, metavar is ignored in help autogeneration", stacklevel=len(inspect.stack()))
+
     return dict(
         metavar=nullify(metavar),
         type=type,

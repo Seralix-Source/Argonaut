@@ -1,3 +1,57 @@
+"""
+command tree, parsing, and dispatch (public API with localized internals).
+
+what this module provides
+- Command: a dynamic, factory-built command node that can:
+  • define positional arguments (cardinals) and named arguments (options/flags),
+  • participate in a tree of subcommands (parent/children),
+  • parse a prompt into a namespace, validate/conflict-check, and dispatch callbacks,
+  • collect warnings/exceptions and finalize with a single grouped exit.
+
+- helpers:
+  • command(...): decorator/factory to create commands (top-level or children).
+  • invoke(...): convenience entry point to run any command-like object.
+  • include(...): discover and mount orphan/template commands via module-globs.
+
+design highlights
+- dynamic classes: commands are factory-built with a metaclass (_CommandType) that:
+  • normalizes the public name (kebab-case) and exposes read-only views of fields,
+  • injects a __call__ that mirrors the original callback signature (_call),
+  • forbids subclassing of such dynamic instances (stable public surface).
+- friendly diagnostics: messages are clear, lowercase, and position-aware:
+  • uses _ordinal() to say “at the third position” or “at the first sub-position”,
+  • adds contextual hints so beginners can learn by empiric feedback.
+- faults: warnings/exceptions flow through trigger(), supporting:
+  • immediate or deferred delivery (deferred=True accumulates faults),
+  • aggregation into CommandExit (ExceptionGroup) on finalize(),
+  • in shell-mode, optional help display before raising.
+
+parsing model (overview)
+- modifiers vs cardinals:
+  • tokens that start with '-' are treated as modifiers (unless a greedy cardinal takes the rest),
+  • otherwise tokens become positional (cardinals), respecting declared order.
+- conversion & choices:
+  • each argument.type is applied to collected values, with CommandWarnings forwarded,
+  • unexpected converter errors are wrapped as UncastableParamError,
+  • values are validated against choices; invalids use InvalidChoiceError.
+- policy checks:
+  • deprecation: DeprecatedArgumentWarning,
+  • duplicates: DuplicateModifierError,
+  • group conflicts: ConflictingGroupError,
+  • standalone-only: StandaloneOnlyError,
+  • inline requirements/excess: InlineParamRequiredError, TooManyInlineParamsError,
+  • arity issues: MissingParamError, AtLeastOneParamRequiredError, NotEnoughParamsError.
+- delegation:
+  • before parsing positionals, a bare token may represent a subcommand (children),
+  • when delegation fails, UnparsedInputError explains what remains and how to proceed.
+
+notes
+- this module cooperates with:
+  • argonaut.arguments for spec classes and decorators,
+  • argonaut.faults for fault types and delivery,
+  • argonaut.internals for StorageGuard, Unset, view, rename, etc.
+- public API is Command, command, invoke; other names are internal.
+"""
 import difflib
 import importlib
 import inspect
@@ -7,10 +61,12 @@ import re
 import shlex
 import sys
 import textwrap
-from collections import defaultdict, deque
+from collections import ChainMap, defaultdict, deque
 from collections.abc import Iterable
 from inspect import Parameter
 from warnings import catch_warnings
+
+from rich.console import Console
 
 from .arguments import Cardinal, Option, Flag, flag
 from .faults import *
@@ -64,7 +120,7 @@ def _call(callback):
             signature.append("*")
             starred = True
         signature.append(parameter.name)
-        arguments.append(parameter.name)
+        arguments.append(f"{parameter.name}={parameter.name}" if parameter.kind is Parameter.KEYWORD_ONLY else parameter.name)
 
     if len(signature) > 1 and signature[1] == "/":
         signature.pop(1)
@@ -76,7 +132,22 @@ def _call(callback):
     """), globals(), namespace := locals())
 
     namespace["__call__"].__doc__ = textwrap.dedent(f"""\
-    """)
+            Dynamically generated invoker that mirrors the command callback signature.
+
+            signature
+            - __call__({", ".join(signature)})
+
+            behavior
+            - forwards all received arguments to the stored callback.
+            - preserves positional-only ("/") and keyword-only ("*") partitions so the
+              runtime calling convention matches the original callback.
+
+            defaults
+            - __defaults__ are seeded from the callback's positional/positional-only defaults
+              (in order), enabling calls without explicitly passing those arguments.
+            - __kwdefaults__ maps keyword-only parameter names to a False sentinel to
+              detect omission at call time when needed by the runtime.
+        """)
 
     namespace["__call__"].__defaults__ = tuple(
         parameter.default.default for parameter in callback.parameters if parameter.kind is not Parameter.KEYWORD_ONLY
@@ -513,7 +584,7 @@ def _process_conflicts(cls, metadata):
       validates shapes and prepares the adjacency map.
     """
     message = f"{cls.__name__} conflicts must be an iterable of iterables of strings"
-    conflicts = {}
+    conflicts = defaultdict(frozenset)
 
     if not isinstance(metadata["conflicts"], Iterable):
         raise TypeError(message)
@@ -530,7 +601,7 @@ def _process_conflicts(cls, metadata):
                 raise TypeError(message)
             if not (group := group.strip()):
                 raise ValueError(f"{cls.__name__} conflicting groups must be a non-empty strings")
-            conflicts[group] = frozenset(groups - {group})
+            conflicts[group] |= groups - {group}
 
     metadata["conflicts"] = conflicts
 
@@ -558,6 +629,51 @@ _parents = {}
 
 
 class Command(StorageGuard, metaclass=_CommandType):
+    """
+    parsed-command node with optional callback and a tree of subcommands.
+
+    responsibilities
+    - represent a single command (or subcommand) in a CLI tree.
+    - hold argument specifications (cardinals/modifiers), help metadata, and
+      runtime flags (fancy/shell/colorful/deferred).
+    - parse an input prompt into a namespace, apply conversions/choices, enforce
+      conflicts and standalone rules, and dispatch argument/command callbacks.
+    - collect faults (warnings/exceptions) and finalize as a single exit point.
+
+    structure
+    - name/descr/usage: presentation metadata used by help/UX.
+    - groups: Mapping[str, tuple[Cardinal|Option|Flag, ...]]
+      specs grouped by help section (e.g., "options", "flags").
+    - cardinals: Mapping[str, Cardinal]
+      positional arguments keyed by their parameter names.
+    - modifiers: Mapping[str, Option|Flag]
+      options/flags keyed by every declared alias (e.g., "--opt", "-o").
+    - conflicts: Mapping[str, Set[str]]
+      mutually-exclusive group adjacency.
+    - parent/children: tree topology for subcommands; root() and rootpath()
+      provide convenient navigation helpers.
+
+    runtime flags
+    - fancy: enable UI embellishments (consumer-defined).
+    - shell: favor shell-like UX (e.g., show help on error).
+    - colorful: colorize auto-generated help when available.
+    - deferred: accumulate faults during parse and report them together.
+
+    common flows
+    - include(): discover and attach orphan/template commands via module-glob.
+    - command(): define a child command via decorator or factory style.
+    - trigger(): route faults immediately or defer them based on settings.
+    - __invoke__(): normalize a prompt and parse+dispatch.
+    - __parse__(): core parsing loop; see its docstring for details.
+    - __finalize__(): drain warnings and raise a grouped CommandExit on errors.
+
+    notes
+    - implicit help: a helper flag (-h/--help) is injected when absent and wired
+      to __show_help(); helper implies standalone→terminator→nowait.
+    - read-only views: public attributes are exposed via the metaclass using view().
+    - dynamic behavior: most instances are factory-built dynamic types; subclassing
+      such instances is forbidden by the metaclass.
+    """
     __fields__ = (
         "name",
         "descr",
@@ -570,6 +686,7 @@ class Command(StorageGuard, metaclass=_CommandType):
         "children",
         "fancy",
         "shell",
+        "colorful",
         "deferred",
     )
 
@@ -655,21 +772,79 @@ class Command(StorageGuard, metaclass=_CommandType):
             *,
             fancy=Unset,
             shell=Unset,
+            colorful=Unset,  # this colors the help auto output
             deferred=Unset,
     ):
+        """
+        build a command node from a callback/spec sequence or clone from a template.
+
+        parameters
+        - source: Command | Callable[..., Any] | Iterable[Supports*]
+          • Command  → clone the template (preserving metadata unless overridden).
+          • Callable → treat function parameters (and defaults) as argument specs.
+          • Iterable → ordered sequence of argument specs (cardinals, then options, then flags).
+        - parent: Command | Unset
+          parent command to attach under. Unset means “no parent yet” (template/orphan).
+        - name: str | Unset
+          command name. Defaults to function.__name__ for callables, or argv[0] basename.
+        - descr: str | Unset
+          dedented short description. Defaults to function docstring for callables.
+        - usage: str | Unset
+          optional usage override (printed by help).
+        - conflicts: Iterable[Iterable[str]] | Unset
+          mutually-exclusive groups, as an iterable of group-name collections.
+          Example: [("output", "stdout"), {"verbose", "quiet"}].
+        - fancy: bool (kw-only)
+          when true, enable “fancy” output/formatting (consumer-defined).
+        - shell: bool (kw-only)
+          when true, suppress raising from faults in some contexts and favor
+          shell-style UX (e.g., print help on failure).
+        - colorful: bool (kw-only)
+          when true, colorize auto-generated help output.
+        - deferred: bool (kw-only)
+          when true, accumulate faults and report them at once during finalize().
+
+        behavior
+        - validates parent type and asserts parent has no cardinals (only leaf nodes may carry cardinals).
+        - clone path (source is Command):
+          • converts the template’s conflicts mapping back to a list-of-iterables form,
+            applies overrides, and returns the clone.
+          • when parent is Unset, the clone is staged (standby) until include() mounts it.
+        - build path (callable/iterable):
+          • resolves source into groups/cardinals/modifiers via _process_source().
+          • normalizes name/descr/usage and conflicts; boolean flags are stabilized.
+          • materializes a dynamic type (factory=True), injects an implicit --help if missing,
+            wires callback/fallback/faults, and attaches to the parent if provided.
+
+        notes
+        - implicit --help: if absent, a helper flag (-h/--help) is injected and wired to __show_help.
+        - colorful/fancy are stored as simple booleans; consumers decide rendering effects.
+        - orphan/template lifecycle: see _standby/_parents for staging and mounting order rules.
+
+        errors
+        - TypeError if parent is not a Command/Unset.
+        - ValueError if parent already has cardinals (non-leaf).
+        """
         if not isinstance(parent, Command | Unset):
             raise TypeError(f"{cls.__name__} parent must be a command")
         elif getattr(parent, "cardinals", {}):
             raise ValueError(f"{cls.__name__} parent must not have cardinals")
 
         if isinstance(source, Command):
+            temp = []
+            for group, groups in source.conflicts.items():
+                temp.append((group, *groups))
+
             clone = type(source).__base__(
                 source.source,
                 parent := nullify(parent, source.parent or Unset),
                 nullify(name, source.name),
                 nullify(descr, source.descr or Unset),
                 nullify(usage, source.usage or Unset),
-                nullify(conflicts, source.conflicts or ()),
+                nullify(conflicts, temp),
+                fancy=nullify(fancy, source.fancy or Unset),
+                shell=nullify(shell, source.shell or Unset),
+                colorful=nullify(colorful, source.colorful or Unset),
                 deferred=nullify(deferred, source.deferred or Unset),
             )
 
@@ -688,6 +863,7 @@ class Command(StorageGuard, metaclass=_CommandType):
             "children": {},
             "fancy": bool(fancy),
             "shell": bool(shell),
+            "colorful": bool(colorful),
             "deferred": bool(deferred),
         }
         metadata |= _process_source(cls, source, metadata["groups"])
@@ -709,7 +885,8 @@ class Command(StorageGuard, metaclass=_CommandType):
         return self
 
     def __show_help(self):
-        pass
+        stderr = bool(object.__getattribute__(self, "-faults"))
+        console = Console(stderr=stderr, style="red" * stderr * self.colorful)
 
     def fallback(self, fallback, /):
         """
@@ -754,6 +931,28 @@ class Command(StorageGuard, metaclass=_CommandType):
         return fallback
 
     def command(self, source=Unset, /, *args, **kwargs):
+        """
+        convenience helper to define a child command under this command.
+
+        usage
+        - decorator mode:
+            @parent.command(name="child")
+            def child(...): ...
+          Returns the created child Command and attaches it to 'parent'.
+
+        - factory mode:
+            parent.command(callback_or_specs, name="child", ...)
+          Mirrors the top-level command(...) API, but automatically sets parent=self.
+
+        parameters
+        - source: Unset | Command | Callable | Iterable[Supports*]
+          Unset enables decorator mode; otherwise forwarded to command(...).
+        - *args, **kwargs: forwarded to command(...), with 'self' injected as parent.
+
+        returns
+        - in decorator mode: a function that accepts the callback and returns a child Command
+        - in factory mode: the created child Command
+        """
         return command(source, self, *args, **kwargs)  # type: ignore[arg-type]
 
     def include(self, source, /):
@@ -850,7 +1049,7 @@ class Command(StorageGuard, metaclass=_CommandType):
         - the fallback, when present, always receives concrete fault objects:
           a single object in immediate mode, a list of objects on drain.
         """
-        options |= {"command": self, "shell": self.shell, "fancy": self.fancy}
+        options |= {"command": self, "shell": self.shell, "fancy": self.fancy, "colorful": self.colorful}
         if self.deferred:
             if hasattr(fault, "__replace__") and callable(fault.__replace__):
                 fault = fault.__replace__(**options)
@@ -860,6 +1059,8 @@ class Command(StorageGuard, metaclass=_CommandType):
                 fault = fault.__replace__(**options)
             fallback(fault)
         else:
+            if self.shell:
+                self.modifiers["--help"]()
             trigger(fault, **options)
 
     def __resolve_token(self, token):
@@ -1137,7 +1338,7 @@ class Command(StorageGuard, metaclass=_CommandType):
                     message = "positional %s has an invalid choice %r" % (_ord(pos), obj)
                 self.trigger(InvalidChoiceError(
                     message,
-                    hint="allowed values are: %r" % (tuple(argument.choices),)
+                    hint="allowed values are: {%s}" % ", ".join(map(repr, argument.choices))
                 ))
         elif parsed is not Unset and parsed not in argument.choices:
             if isinstance(argument, Option):
@@ -1146,18 +1347,135 @@ class Command(StorageGuard, metaclass=_CommandType):
                 message = "positional %s has an invalid choice %r" % (_ord(self.index), parsed)
             self.trigger(InvalidChoiceError(
                 message,
-                hint="allowed values are: %r" % (tuple(argument.choices),)
+                hint="allowed values are: {%s}" % ", ".join(map(repr, argument.choices))
             ))
 
         return nullify(parsed, argument.default)
 
+    def __finalize(self, *, help=True):
+        """
+        internal: drain collected faults, optionally show help, and raise a grouped exit.
+
+        purpose
+        - Deliver all queued warnings immediately.
+        - Aggregate collected command exceptions into a CommandExit and trigger it,
+          allowing a single failure path for multiple parse/conversion issues.
+        - In shell mode, optionally show help before raising when helpful.
+
+        parameters
+        - help: bool (keyword-only)
+          when True and shell-mode is active, attempt to show the built-in help
+          (via the implicit --help handler) before triggering the exit group.
+
+        behavior
+        - partitions the internal faults buffer into warnings and exceptions.
+        - triggers warnings first (non-blocking).
+        - constructs a CommandExit(exceptions) and:
+          • if shell and help is True, invokes the help handler,
+          • triggers the exit group (raising unless suppressed elsewhere).
+        - ValueError raised by CommandExit construction is ignored (treated as
+          “no exceptions to report”).
+
+        notes
+        - this method does not clear the internal faults list; the caller governs
+          lifecycle and subsequent reuse/return paths.
+        - help invocation relies on the implicit --help being present (injected
+          during command construction when absent).
+        """
+        exceptions = []
+        warnings = []
+        for fault in object.__getattribute__(self, "-faults"):
+            if isinstance(fault, CommandException):
+                exceptions.append(fault)
+            else:
+                warnings.append(fault)
+
+        for warning in warnings:
+            trigger(warning, **{"command": self, "shell": self.shell, "fancy": self.fancy, "colorful": self.colorful})
+
+        try:
+            exit = CommandExit(exceptions)
+            if self.shell and help:
+                self.modifiers["--help"]()
+            trigger(exit, **{"command": self, "shell": self.shell, "fancy": self.fancy, "colorful": self.colorful})
+        except ValueError:
+            pass
+
     def __parse(self, tokens, index=1, /, *, faults=()):
-        faults = object.__getattribute__(self, "-faults")
-        faults[::] = faults
+        """
+        internal: parse a command line for this command node and dispatch callbacks.
+
+        parameters
+        - tokens: deque[str] | Iterable[str]
+          stream of tokens to consume (typically a deque). The method mutates it
+          by popping consumed items from the left.
+        - index: int (1-based)
+          logical position counter for user-facing messages. Increments as tokens
+          are consumed so diagnostics can say “at the Nth position”.
+        - faults: list[CommandException | CommandWarning]
+          external fault buffer (used when delegating to subcommands). The current
+          command’s fault storage is rebound to this list so all raised/queued
+          faults end up in a single place for finalize().
+
+        side effects
+        - self.namespace: dict[str, Any]
+          populated with parsed values keyed by:
+            • cardinals: their declared names (from the callback signature)
+            • options/flags: all declared aliases (each name points to the same value)
+        - self.tokens: set to the provided token source and advanced during parsing.
+        - self.index: advanced as positional progress indicator for messages.
+        - internal faults buffer is extended with generated faults; finalize() drains it.
+
+        flow (high level)
+        - while there are tokens:
+          • resolve next token as:
+            – a modifier (option/flag) when it starts with '-' (unless a greedy
+              cardinal is next), or
+            – a subcommand when children exist and no arguments were parsed yet, or
+            – a positional (cardinal) otherwise.
+          • deprecation: emit a DeprecatedArgumentWarning for deprecated args.
+          • duplicate: emit DuplicateModifierError when a modifier repeats improperly.
+          • collect params according to argument.nargs; convert via argument.type
+            and surface warnings/exceptions with contextual, beginner-friendly messages.
+          • group conflicts: check against previously-seen groups; emit ConflictingGroupError.
+          • standalone: if this argument is standalone=True and others are present
+            (or more tokens remain), emit StandaloneOnlyError.
+          • nowait: if argument.nowait, invoke the argument callback immediately.
+            If argument.terminator, call finalize() and return early.
+        - when tokens remain unparsed:
+          • emit UnparsedInputError with a tailored hint depending on whether
+            delegation to a subcommand was attempted (tried) and whether children exist.
+
+        post-collection
+        - invoke callbacks for any remaining arguments that were not called in
+          nowait phase (in a stable order based on the spec).
+        - for any missing cardinals (no more tokens and some cardinals unfilled),
+          emit MissingParamError / AtLeastOneParamRequiredError / NotEnoughParamsError
+          using an ordinal based on the missing cardinal index (not the exhausted self.index),
+          then seed namespace with defaults.
+
+        finalize and dispatch
+        - call finalize() to emit warnings and raise CommandExit when exceptions
+          were collected (or print help when shell=True).
+        - if this command has no callback (__call__ synthesized is unset), return
+          the namespace (with defaults for all modifier aliases); otherwise, build
+          positional args/kwargs based on the original callback signature and invoke it.
+
+        returns
+        - dict[str, Any] when there is no callback to invoke (leafless/spec-driven commands).
+        - None when a callback is present and has been invoked.
+        """
+        old = object.__getattribute__(self, "-faults")
+        old[::] = faults
+        faults = old
 
         self.namespace = {}
         self.tokens = tokens
         self.index = index
+
+        conflicts = defaultdict(frozenset, self.conflicts)  # type: ignore[arg-type]
+        groups = set()
+        calls = set()
 
         cardinals = deque(self.cardinals.keys())
         tried = False
@@ -1178,6 +1496,7 @@ class Command(StorageGuard, metaclass=_CommandType):
                     suggestions = difflib.get_close_matches(token, self.children.keys(), n=5, cutoff=0.85)
                     exception = UnknownCommandError if not self.parent else UnknownSubcommandError
                     cmdtype = "command" if not self.parent else "subcommand"
+                    tried = True
 
                     try:
                         hint = f"did you mean %r?" % suggestions[0]
@@ -1235,8 +1554,10 @@ class Command(StorageGuard, metaclass=_CommandType):
                 ))
 
             if isinstance(argument, Cardinal):
+                index = self.index
                 self.namespace[input] = self.__parsearg(argument, input, self.tokens)
             elif isinstance(argument, Option):
+                index = self.index - 1
                 if param and os.pathsep in param:
                     splitter = os.pathsep
                 else:
@@ -1250,13 +1571,174 @@ class Command(StorageGuard, metaclass=_CommandType):
                     ))
                 self.namespace.update(dict.fromkeys(argument.names, self.__parsearg(argument, input, tokens, inline=bool(param))))
             elif isinstance(argument, Flag):
+                index = self.index - 1
                 self.namespace.update(dict.fromkeys(argument.names, True))
             else:
                 raise RuntimeError("unexpected argument type")
 
-            print(self.namespace)
+            if conflicts := self.conflicts[group := argument.group] & groups:
+                # report using index; at = not a cardinal, frm = cardinal
+                pos = _ordinal(
+                    index,
+                    at=not isinstance(argument, Cardinal),
+                    frm=isinstance(argument, Cardinal)
+                )
+                # build a concise, friendly message
+                if isinstance(argument, Option):
+                    subject = "option %r %s" % (input, pos)
+                elif isinstance(argument, Flag):
+                    subject = "flag %r %s" % (input, pos)
+                else:
+                    subject = "positional argument %s" % pos
+                self.trigger(ConflictingGroupError(
+                    "%s conflicts with group%s %s" % (
+                        subject,
+                        "" if len(conflicts) == 1 else "s",
+                        ", ".join(sorted(conflicts))
+                    ),
+                    hint="remove one of the conflicting arguments or use them separately"
+                ))
+            groups.add(group)
+
+            if getattr(argument, "standalone", False) and (self.namespace.keys() - argument.names or self.tokens):
+                subject = ("option %r %s" if isinstance(argument, Option) else "flag %r %s") % (input, _ordinal(index, at=True))
+                if argument.helper:
+                    message = "%s must be used alone" % subject
+                    hint = "run it without other arguments"
+                else:
+                    message = "%s must be the only argument" % subject
+                    hint = "remove other arguments and run it alone"
+                self.trigger(StandaloneOnlyError(message, hint=hint))
+
+            if argument.nowait:
+                if isinstance(argument, Flag):
+                    argument()
+                elif not argument.nargs or argument.nargs == "?":
+                    argument(self.namespace[input])
+                elif argument in ("*", "+", Ellipsis) or isinstance(argument, int):
+                    argument(*self.namespace[input])
+
+                if getattr(argument, "terminator", False):
+                    self.__finalize(help=input not in self.modifiers["--help"].names)
+                    return
+
+                calls.update(getattr(argument, "names", (input,)))
+
+        if self.tokens:  # This means that there's unparsed arguments
+            first = self.tokens[0]
+            where = _ordinal(self.index, at=True)
+            cmdtype = "command" if not self.parent else "subcommand"
+
+            if not self.children:
+                # no delegation possible here; leftover input couldn't be parsed
+                message = "could not parse the remaining input starting at %r %s" % (first, where)
+                hint = "run '%s --help' to see valid arguments for this %s" % (
+                    " ".join(command.name for command in self.rootpath), cmdtype
+                )
+            elif tried:
+                # we attempted to delegate but nothing matched; input remains unparsed
+                message = "could not parse the remaining input starting at %r %s; no subcommand matched" % (first,
+                                                                                                            where)
+                hint = "run '%s --help' to see available subcommands" % (
+                    " ".join(command.name for command in self.rootpath)
+                )
+            else:
+                # children exist but user provided extra/unknown tokens instead of a subcommand or valid args
+                message = "could not parse the remaining input starting at %r %s for this %s" % (first, where, cmdtype)
+                hint = "run '%s --help' to see how to use this %s" % (
+                    " ".join(command.name for command in self.rootpath), cmdtype
+                )
+
+            self.trigger(UnparsedInputError(message, hint=hint))
+
+
+        for input, argument in ChainMap(self.cardinals, self.modifiers).items():  # type: ignore[arg-type]
+            if input not in self.namespace or input in calls:  # No need to redundancy check, calls is updated with all names
+                continue
+            if isinstance(argument, Flag):
+                argument()
+            elif not argument.nargs or argument.nargs == "?":
+                argument(self.namespace[input])
+            elif argument in ("*", "+", Ellipsis) or isinstance(argument, int):
+                argument(*self.namespace[input])  # NOQA
+            calls.update(getattr(argument, "names", (input,)))
+
+        offset = len(self.cardinals) - len(cardinals)
+        while cardinals:
+            argument = self.cardinals[input := cardinals.popleft()]  # type: ignore[misc]
+
+            if not (nargs := argument.nargs):
+                position = _ordinal(offset + 1)
+                self.trigger(MissingParamError(
+                    "missing %s positional argument needs a param" % position,
+                    hint="write a param after it"
+                ))
+            elif nargs == "+":
+                position = _ordinal(offset + 1)
+                self.trigger(AtLeastOneParamRequiredError(
+                    "missing %s positional argument needs at least one param" % position,
+                    hint="write one or more params after it"
+                ))
+            elif isinstance(nargs, int):
+                position = _ordinal(offset + 1)
+                self.trigger(NotEnoughParamsError(
+                    "missing %s positional argument needs %d param%s" % (position, nargs, "" if nargs == 1 else "s"),
+                    hint="write the remaining param%s after it" % ("" if nargs == 1 else "s")
+                ))
+            self.namespace[input] = argument.default
+            offset += 1
+
+        self.__finalize()
+
+
+        if not (callback := object.__getattribute__(self, "-callback")):
+            namespace = self.namespace
+            del self.namespace
+            del self.tokens
+            del self.index
+
+            for argument in self.modifiers.keys():
+                for name in argument.names:  # type: ignore[attr-defined]
+                    namespace.setdefault(name, argument.default)  # type: ignore[attr-defined]
+
+            return namespace
+
+        args = ()
+        for parameter in filter(lambda x: x.kind is not Parameter.KEYWORD_ONLY, callback.parameters):
+            args += self.namespace.get(next(iter(getattr(parameter.default, "names", (parameter.name,)))), parameter.default.default),
+
+        kwargs = {}
+        for parameter in filter(lambda x: x.kind is Parameter.KEYWORD_ONLY, callback.parameters):
+            kwargs[parameter.name] = self.namespace.get(next(iter(parameter.default.names)), False)
+
+
+        del self.namespace
+        del self.tokens
+        del self.index
+        callback(*args, **kwargs)
 
     def __invoke__(self, prompt=Unset, /):
+        """
+        internal: entry point to run this command with a prompt.
+
+        parameters
+        - prompt: Unset | str | Iterable[str]
+          • Unset      → use sys.argv[1:]
+          • str        → split with shlex.split(prompt)
+          • Iterable   → consume as-is after validating all items are strings
+
+        behavior
+        - normalizes the prompt into a list of tokens and delegates to __parse(...)
+          with a fresh deque so tokens can be consumed from the left.
+
+        errors
+        - TypeError when prompt is neither a string nor an iterable of strings.
+
+        returns
+        - dict[str, Any] | None
+          • dict when the command has no callback (spec-driven; returns namespace)
+          • None when a callback is present and has been invoked
+        """
         if prompt is Unset:
             tokens = sys.argv[1:]
         elif isinstance(prompt, str):
@@ -1271,15 +1753,62 @@ class Command(StorageGuard, metaclass=_CommandType):
 
 
 def command(source=Unset, /, *args, **kwargs):
+    """
+    decorator/factory for building Command objects.
+
+    usage
+    - as a decorator (no positional 'source'):
+        @command(name="tool")
+        def run(...): ...
+      The decorated callable becomes the command callback. The decorator returns
+      a Command instance.
+
+    - as a factory (explicit source is a callable/specs/command):
+        cmd = command(callback_or_specs, parent=..., name=..., conflicts=..., ...)
+        • callable → parameters/defaults are interpreted as argument specs
+        • iterable of specs → [cardinals..., options..., flags...]
+        • Command → clone from a template, applying overrides
+
+    parameters
+    - source: Unset | Command | Callable | Iterable[Supports*]
+      Unset means “decorator mode”; otherwise it is passed to Command.__new__.
+    - *args, **kwargs: forwarded to Command(...) (e.g., parent, name, descr, usage,
+      conflicts, fancy, shell, colorful, deferred).
+
+    returns
+    - in decorator mode: a function that accepts the callback and returns a Command
+    - in factory mode: a Command instance
+    """
     @rename("command")
     def decorator(source):
-        if decorating and not callable(source):
+        if decorating and not callable(source) and not isinstance(source, Command):
             raise TypeError("@command() must be applied to a callable or a command")
         return Command(source, *args, **kwargs)
     return decorator(source) if not (decorating := source is Unset) else decorator
 
 
 def invoke(x, prompt=Unset, /):
+    """
+    convenience entry point to run a command-like object.
+
+    parameters
+    - x: Command | Invocable | Callable
+      • Command/Invocable → call its __invoke__(prompt) (or __invoke__() when prompt is Unset).
+      • Callable          → wrapped into a Command implicitly (fallback; supported but not intended).
+    - prompt: Unset | Any
+      forwarded to __invoke__. When Unset, the callee decides (typically sys.argv[1:]).
+
+    behavior
+    - if x exposes __invoke__, delegate to it directly.
+    - otherwise, attempt to wrap x as a command (command(x)) and invoke that.
+      This fallback is allowed, but not intended for long-term use.
+
+    errors
+    - TypeError when x is neither a command-like object nor a callable suitable for wrapping.
+
+    returns
+    - the return value of __invoke__ (dict[str, Any] | None) depending on the command shape.
+    """
     if hasattr(x, "__invoke__"):
         return x.__invoke__(prompt) if prompt is not Unset else x.__invoke__()
     try:  # Is supported this fallback, but not intended
