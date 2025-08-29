@@ -1,3 +1,4 @@
+__path__: list[str]
 __title__: str
 __author__: str
 __license__: str
@@ -6,7 +7,6 @@ __version__: str
 
 from typing import NamedTuple, Literal, Final, Self
 
-from .argonauter import *
 from .arguments import *
 from .commands import *
 from .faults import *
@@ -18,6 +18,7 @@ class VersionInfo(NamedTuple):
     micro: int
     releaselevel: Literal["alpha", "beta", "candidate", "final"]
     serial: int
+    metadata: str
 
     def __new__(
             cls,
@@ -25,7 +26,8 @@ class VersionInfo(NamedTuple):
             minor: int,
             micro: int,
             releaselevel: Literal["alpha", "beta", "candidate", "final"],
-            serial: int
+            serial: int,
+            metadata: str,
     ) -> Self: ...
 
 

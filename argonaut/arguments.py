@@ -1,525 +1,458 @@
-"""
-argument specifications and factories (public API with localized internals).
+r"""
+Argonaut argument specifications and decorators.
 
-what this module provides (public)
-- specs:
-  • Cardinal: positional (supports greedy remainder via Ellipsis).
-  • Option: named, value-bearing.
-  • Flag: presence-only switch.
-- factories/decorators:
-  • cardinal(...), option(...), flag(...): build specs and attach callbacks in a
-    single step; each decorator also exposes a retrieval hook (__cardinal__/__option__/__flag__)
-    to satisfy Supports* protocols in type checkers.
+Overview
+- Specs
+  • Cardinal[_T]: positional, value-bearing argument (supports fixed/optional/variadic and greedy arity).
+  • Option[_T]: named, value-bearing option with one or more aliases (e.g., -o/--output).
+  • Flag: named, presence-only switch (no payload), e.g., -v/--verbose.
 
-core behaviors
-- each spec instance:
-  • carries normalized, read-only metadata (exposed via properties).
-  • may hold a single-assignment callback (installed by the decorators).
-  • renders compact, predictable representations (__repr__/__rich_repr__).
+- Decorators
+  • @cardinal(...): build and bind a Cardinal to a handler function.
+  • @option(...): build and bind an Option to a handler function.
+  • @flag(...): build and bind a Flag to a handler function.
+  Each decorator returns a configured spec whose __call__ forwards to the bound handler.
 
-- arity and invocation:
-  • __call__ is generated for “factory” classes based on nargs (single, optional,
-    variadic '*', variadic '+', fixed-N, or greedy ellipsis for cardinals) and
-    forwards to the stored callback when set.
+- Introspection & representation
+  • ArgumentType metaclass provides stable __repr__/__rich_repr__ and exposes selected
+    fields via read-only properties declared in __introspectable__/__displayable__.
+  • Dynamic __call__ signatures are generated to match declared arity for clean help
+    and introspection (see _invoker).
 
-- validation/normalization:
-  • _process_metadata: group/descr (strings, non-empty); group defaults via _pluralize.
-  • _process_named_metadata: option/flag names (unicode-friendly, hyphen segments, no '_').
-  • _process_variadic_metadata: metavar/type/nargs/default/choices, including cardinal
-    rules (ellipsis and “no explicit metavar” when greedy).
+Metadata (sanitized on construction)
+- Shared (all specs)
+  • group: Unset | str (defaults to pluralized typename), non-empty when provided.
+  • descr: Unset | str | Text (short help), non-empty when provided.
+- Cardinal/Option only (value-bearing)
+  • metavar: Unset | str (label in help; forbidden for greedy "...").
+  • type: Callable (converter/validator).
+  • nargs: Unset | "?" | "+" | "*" | int (>=1) | Ellipsis (greedy, Cardinal only).
+  • choices: Iterable (duplicates rejected unless a Set).
+- Named (Option/Flag)
+  • names: Iterable[str] validated as shell-style identifiers; duplicates rejected.
+  • helper/standalone/terminator/nowait wiring is normalized (helper implies standalone+terminator; terminator implies nowait).
+- Visibility
+  • hidden: bool (suppresses from help).
+  • deprecated: bool (marked and styled accordingly).
 
-about “internals” in this file
-- this module is public, but contains a few one-domain internal helpers to keep the
-  public surface small and predictable (e.g., _call, _pluralize, _process_*).
-- StorageGuard and view come from argonaut.internals and are used to implement
-  read-only backing storage and safe property exposure; their presence here is an
-  implementation detail and not intended for direct use by applications.
+Validation highlights
+- Names must match r"--?[^\W\d_](-?[^\W_]+)*" and be unique within a spec.
+- Cardinal must not specify a metavar when nargs is Ellipsis ("...").
+- Option cannot combine metavar and choices simultaneously.
+- Collections (choices) reject duplicates unless provided as a Set.
+- group/descr strings are trimmed; empty strings are rejected.
 
-stability
-- classes and decorator/factory functions in this module are part of the exposed API.
-- helpers prefixed with '_' are internal and may change without notice.
+Dynamic calling
+- _invoker(nargs) builds a cached __call__ that:
+  • No-ops if _callback is Unset; otherwise forwards arguments unchanged.
+  • Presents a clean, introspectable signature that matches the declared arity.
+  • Binds defaults for optional-single forms where applicable.
+
+Quick example:
+    >>> from argonaut.arguments import cardinal, option, flag
+    >>> @cardinal("FILE")
+    >>> def on_file(file): ...
+    ...
+    >>> @option("-t", "--threads", metavar="THD", type=int, nargs="?")
+    >>> def on_threads(threads): ...
+    ...
+    >>> @flag("-v", "--verbose")
+    >>> def on_verbose(): ...
+    ...
+
+Public API
+- Classes: Cardinal, Option, Flag
+- Decorators: cardinal, option, flag
 """
 import builtins
 import functools
-import inspect
+import operator
 import re
 import textwrap
-import warnings
 from collections.abc import Iterable, Set
 from types import EllipsisType, MethodType
 
-from .internals import *
+from rich.text import Text
+
+from .utils import *
 
 
-def _call(options):
+@functools.cache
+def _invoker(nargs, /):
     """
-    internal: compile a __call__ compatible with the given nargs spec.
+    Build and cache a tailored __call__ method for a given arity pattern.
 
-    purpose
-    - generate a bound method whose signature matches the arity encoded in 'options'.
-      this keeps instances callable in a way that mirrors how many values an argument
-      accepts (single, optional, variadic, fixed-N, or greedy remainder).
+    This internal factory emits a small trampoline that:
+    - No-ops when self._callback is Unset (silently returns None).
+    - Otherwise forwards all received arguments to self._callback unchanged.
 
-    inputs
-    - options: dict-like containing at least:
-        • "nargs": one of
-            Unset           → zero-arity (used by flags/switches)
-            None | "?"      → optional single parameter
-            "*" | Ellipsis  → 0..* parameters (variadic)
-            "+"             → 1..* parameters (variadic with one required)
-            int >= 1        → exactly N positional-only parameters
-        • "default": any (only consulted when nargs == "?" to seed __defaults__)
+    The generated signature depends on nargs:
+    - "?" or "+" or None: a single positional-only parameter named 'param'
+    - int n: exactly n positional-only parameters named 'parameter0'..'parameter{n-1}'
+    - "*", "+", or Ellipsis: a variadic tail '*params'
 
-    generated behavior
-    - builds a function named __call__ with a signature that matches the selected arity:
-        • "/" is used to mark positional-only parameters for clarity.
-        • the method fetches the stored callback from the internal backing field
-          "-callback"; if unset, it no-ops; otherwise, it forwards the collected
-          arguments.
+    Notes
+    - The default value for the nargs="?" case is managed by the caller/builder,
+      not here. This function only shapes the call interface and forwarding logic.
+    - The result is cached per nargs to avoid re-emitting identical trampolines.
 
-    notes
-    - this function does not validate 'options' beyond what pattern matching implies;
-      callers are responsible for providing coherent specs.
-    - for the optional single-parameter form ("?"), the default value is attached to
-      __call__.__defaults__ so omitting the argument calls the callback with the
-      provided default.
+    Returns
+    - A function object suitable to be bound as __call__(self, ...).
     """
-    # Decide the callable signature and forwarding expression based on 'nargs'
-    match nargs := options.get("nargs", Unset):
-        case UnsetType():                  # zero-arity (e.g., flags)
-            signature = "(self)"
-            arguments = ""
-        case "?" | None:                   # optional single parameter
-            signature = "(self, param, /)"
-            arguments = "param"
-        case "*" | EllipsisType():         # variadic (0..*)
-            signature = "(self, *params)"
-            arguments = "*params"
-        case "+":                          # variadic with one required (1..*)
-            signature = "(self, param, /, *params)"
-            arguments = "param, *params"
-        case _:
-            # fixed-N positional-only parameters (N >= 1)
-            signature = "(self, %s, /)" % (arguments := ", ".join("param%d" % index for index in range(nargs)))
+    signature = ["self"]
+    arguments = []
 
-    # Compile the __call__ with the computed signature and simple forwarding logic.
-    # - Access the backing field "-callback" directly (bypassing property/guards).
-    # - If unset (Unset), do nothing; otherwise, invoke with the prepared arguments list.
+    # Optional/single argument forms
+    if nargs in ("?", "+", None):
+        signature.append("param")
+        arguments.append("param")
+
+    # Fixed-arity: parameter0, parameter1, ...
+    if isinstance(nargs, int):
+        signature.extend("parameter" + str(index) for index in range(nargs))
+        arguments.extend("parameter" + str(index) for index in range(nargs))
+
+    # Mark preceding args as positional-only if any were added
+    if len(signature) > 1 and len(arguments) > 0:
+        signature.append("/")  # positional-only marker
+
+    # Variadic tail forms
+    if nargs in ("*", "+", Ellipsis):
+        signature.append("*params")
+        arguments.append("*params")
+
+    # Emit a tiny forwarding trampoline with the computed signature.
+    # Using exec here allows us to present a clean, introspectable signature.
     exec(textwrap.dedent(f"""
         @rename("__call__")
-        def __call__{signature}:
-            if (callback := object.__getattribute__(self, "-callback")) is Unset:
+        def __call__({", ".join(signature)}):
+            # If no callback is provided, do nothing (return None).
+            if self._callback is Unset:
                 return
-            return callback({arguments})
+            # Forward arguments as-is to the underlying callback.
+            return self._callback({", ".join(arguments)})
     """), globals(), namespace := locals())
 
-    # Seed a default only for the optional-single-parameter form, so the call
-    # can be made as __call__() and the callback receives the provided default.
-    if nargs == "?":
-        namespace["__call__"].__defaults__ = (options["default"],)
+    # Document the dynamically generated __call__ for better introspection.
+    namespace["__call__"].__doc__ = textwrap.dedent(f"""
+        Dynamically generated __call__ for nargs={nargs!r}.
 
-    namespace["__call__"].__doc__ = textwrap.dedent(f"""\
-            internal: generated invoker for this spec.
+        Behavior
+        - If self._callback is Unset, returns None (no-op).
+        - Otherwise forwards all received arguments to self._callback unchanged.
 
-            signature
-            - __call__{signature}
+        Signature shape
+        - "?" or "+" or None: one positional-only argument 'param'
+        - int n: positional-only 'parameter0'..'parameter{{n-1}}'
+        - "*", "+", or Ellipsis: variadic tail '*params'
 
-            behavior
-            - no-op when the stored callback is Unset.
-            - otherwise forwards to the stored callback as: callback({arguments or ""})
-
-            arity
-            - derived from options['nargs'] = {nargs!r}
-              • Unset      → zero-arity (flags/switches)
-              • None | "?" → optional single
-              • "*"        → zero or more (variadic)
-              • "+"        → one or more (variadic)
-              • int >= 1   → exactly N positional-only
-              • Ellipsis   → greedy remainder
-        """)
+        Notes
+        - The default for the nargs="?" case (when no value is provided) is set
+          by the builder outside of this function.
+        - This method is internal and intended to be bound on instances that
+          provide a _callback attribute.
+    """)
 
     return namespace["__call__"]
 
 
-class _ArgumentType(type):
+class ArgumentType(type):
     """
-    internal metaclass that synthesizes the public surface of argument specs.
+    Metaclass that turns specs into callable, introspectable descriptors.
 
-    responsibilities
-    - normalize the public class name to kebab-case (for consistent diagnostics).
-    - expose declared metadata fields (__fields__) as read-only properties via view(...).
-    - inject friendly representations:
-      • __repr__: compact, debug-oriented one-liner
-      • __rich_repr__: yields (key, value) pairs for pretty/rich printers
-    - optionally install an arity-aware __call__ when building “factory” classes
-      (options["factory"] is truthy). the generated invoker is compiled by _call(...)
-      and carries its own docstring describing signature and behavior.
-    - optionally fence generated classes against subclassing by installing a
-      raising __init_subclass__ (when options["factory"] is truthy).
+    Responsibilities
+    - Inject a tailored __call__ when constructing factory-backed spec classes.
+      The shape of __call__ depends on 'nargs' and is created via _invoker.
+    - Provide stable, readable __repr__/__rich_repr__ implementations for
+      diagnostics and help output.
+    - Expose selected fields as read-only properties using mirror() for all
+      names listed in __introspectable__.
+    - Seal factory-backed spec classes against subclassing to keep semantics
+      predictable.
 
-    inputs (via class creation)
-    - __fields__: tuple[str, ...] (class attribute in the namespace)
-      names of metadata fields to expose as read-only views.
-    - **options:
-      • factory: bool (default False)
-        when true, injects __call__ and forbids subclassing of the generated type.
-
-    notes
-    - __module__ is set to Unset when building “limbo” types; callers finalize/attach
-      the dynamic class later. consumers should not rely on this value during build.
-    - this metaclass does not validate field values; upstream helpers perform
-      normalization/validation (e.g., _process_* functions).
+    Conventions
+    - __typename__ is derived from the class name (camel-case split with hyphens)
+      and used in messages and help output.
+    - __displayable__ (if set) narrows which properties are shown by __rich_repr__;
+      otherwise __introspectable__ is used.
     """
-    __fields__ = ()
+    __introspectable__ = ()
+    __displayable__ = Unset
 
-    def __new__(metacls, name, bases, namespace, /, **options):
-        # when building a “factory” class, inject an arity-aware __call__ upfront.
-        # _call attaches its own docstring describing the generated invoker.
+    def __new__(cls, name, bases, namespace, **options):
+        """
+        Construct a new spec class and wire dynamic behavior if requested.
+
+        Options
+        - factory: when True, the resulting class represents a concrete,
+          ready-to-use spec that should receive a generated __call__ and be
+          sealed against subclassing.
+        - nargs: arity pattern forwarded to _invoker to shape __call__.
+        - default: default value used to bind __call__ when nargs == "?".
+
+        Returns
+        - type: the newly constructed class with introspection and call plumbing.
+        """
+        # If this is a factory-backed spec, generate a tailored __call__ upfront.
         if options.get("factory", False):
-            namespace |= {"__call__": _call(options)}
+            namespace["__call__"] = _invoker(nargs := options.get("nargs", Unset))
+            # For optional-single args, bind the default as the sole parameter default.
+            namespace["__call__"].__defaults__ = (options.get("default"),) if nargs == "?" else ()
 
-        # normalize the public class name to kebab-case; keep limbo semantics by
-        # setting __module__ to Unset (internal sentinel) until the dynamic class
-        # is finalized/attached by the caller.
-        cls = super().__new__(
-            metacls,
-            name := re.sub(r"(?<!^)(?=[A-Z])", r"-", name.strip("_")).lower(),
+        # Build the class with:
+        # - __typename__ derived from the class name for consistent messaging.
+        # - __module__ marked as dynamic to make the origin explicit in tooling.
+        # - Read-only properties for all declared __introspectable__ names.
+        self = super().__new__(
+            cls,
+            name,
             bases,
             namespace | {
-                "__module__": Unset,  # internal: “limbo” module marker until finalized
-                "__qualname__": name  # present the kebab-case name consistently
+                "__typename__": re.sub(r"(?<!^)(?=[A-Z])", r"-", name).lower(),
+                "__module__": "dynamic-factory::arguments",
             } | {
-                # expose read-only public attributes for declared fields
-                # (each returns an immutable “view” of its backing storage)
-                name: view(name) for name in namespace.get("__fields__", ())
-            }
-        )
+                name: mirror(name) for name in namespace.get("__introspectable__", ())
+            },
+            )
 
+        # Provide a compact, stable string representation for diagnostics.
         @rename("__repr__")
         def __repr__(self):
             """
-            debug-friendly repr.
+            Return a concise, stable representation with key metadata.
 
-            shape
-            - <typename>(key=value, ...) using the current metadata snapshot.
-
-            notes
-            - values are read through the same pairs yielded by __rich_repr__ so
-              representation stays consistent between plain and rich output.
+            Example
+            - option(names={'-v', '--verbose'}, group='options', ...)
             """
-            return f"{name}({", ".join("%s=%r" % pair for pair in self.__rich_repr__())})"
+            return f"{type(self).__typename__}({
+                ", ".join(map(functools.partial(operator.mod, "%s=%r"), self.__rich_repr__()))
+            })"
+        self.__repr__ = __repr__
 
-        cls.__repr__ = __repr__
-
+        # Structured representation for pretty printers (e.g., rich).
         @rename("__rich_repr__")
         def __rich_repr__(self):
             """
-            rich-friendly representation.
+            Yield a sequence of (name, object) pairs for pretty printers.
 
-            behavior
-            - yield (key, value) pairs for all declared __fields__ so rich/pretty
-              printers can render a compact table-like view.
-
-            notes
-            - this function reads backing values directly (bypassing properties) to
-              avoid any additional wrapping; public properties already return frozen
-              views of container types.
+            The set of names comes from type(self).__displayable__ if provided,
+            otherwise from type(self).__introspectable__.
             """
-            for field in type(self).__fields__:
-                yield field, object.__getattribute__(self, "-" + field)
+            for name in coalesce(type(self).__displayable__, type(self).__introspectable__):
+                yield name, getattr(self, name)
+        self.__rich_repr__ = __rich_repr__
 
-        cls.__rich_repr__ = __rich_repr__
-
-        if options.get("factory", False):  # dynamic, generated class instance
+        if options.get("factory", False):
+            # Factory-backed spec classes are sealed to avoid subclassing surprises.
             @rename("__init_subclass__")
-            def __init_subclass__(cls, **options):
+            def __init_subclass__(cls, **options):  # NOQA: F-841
                 """
-                forbid subclassing of generated types.
-
-                rationale
-                - factory-built classes are finalized at construction time; allowing
-                  subclassing would break immutability guarantees and widen surface
-                  area without benefit.
+                Disallow subclassing of factory-backed spec classes.
                 """
-                raise TypeError(f"type {name!r} is not an acceptable base type")
+                raise TypeError(f"type {self.__name__!r} is not an acceptable base type")
+            self.__init_subclass__ = classmethod(__init_subclass__)
 
-            cls.__init_subclass__ = classmethod(__init_subclass__)
-
-        return cls
+        return self
 
 
-@functools.cache
-def _pluralize(typename):
+def _sanitize_metadata(cls, metadata, /):
     """
-    internal: derive a human-friendly plural from a kebab-case typename.
+    Internal: normalize and validate shared argument metadata.
 
-    assumptions
-    - typename arrives already normalized in kebab-case (e.g., "option", "cardinal",
-      "some-custom-name"). hyphens are replaced with spaces for presentation.
+    This helper is used by Cardinal[_T], Option[_T], and Flag to enforce
+    consistent semantics for the 'group' and 'descr' fields:
+    - group: optional human-readable category name. If omitted (Unset),
+      it defaults to the pluralized typename (e.g., "cardinals", "options", "flags").
+      If provided, it must be a non-empty string after trimming.
+    - descr: optional short description. If omitted (Unset), it becomes None.
+      If provided, it must be a non-empty string after trimming.
 
-    behavior
-    - pluralizes only the last token; rejoins with spaces.
-    - applies a small set of irregulars and simple english suffix rules.
+    Parameters
+    - cls: the specification class providing a __typename__ attribute.
+    - metadata: dict containing at least the keys 'group' and 'descr'.
+      The dict is modified in place with sanitized values.
 
-    examples
-    - "cardinal"         → "cardinals"
-    - "option"           → "options"
-    - "switch"           → "switches"
-    - "policy"           → "policies"
-    - "some-custom-name" → "some custom names"
+    Raises
+    - TypeError: if 'group' or 'descr' is not a string or Unset.
+    - ValueError: if 'group' or 'descr' is a string but empty after trimming.
+
+    Notes
+    - This function mutates the provided metadata dict in place.
+    - The default for nargs="?" use cases is handled elsewhere by the builder.
     """
-    name = typename.strip().lower()
-    if not name:
-        return "items"
+    # Validate and normalize the 'group' metadata
+    if not isinstance(group := metadata["group"], str | Unset):
+        raise TypeError(f"{cls.__typename__} 'group' must be a string")
+    elif isinstance(group, str) and not (group := group.strip()):
+        # Non-empty after trimming
+        raise ValueError(f"{cls.__typename__} 'group' cannot be empty")
 
-    tokens = name.split("-")
+    # Default group: pluralized typename (hyphens replaced for nicer output)
+    metadata["group"] = coalesce(group, pluralize(cls.__typename__.replace("-", " ")))
 
-    head, tail = " ".join(tokens[:-1]), tokens[-1]
+    # Validate and normalize the 'descr' metadata
+    if not isinstance(descr := metadata["descr"], str | Text | Unset):
+        raise TypeError(f"{cls.__typename__} 'descr' must be a string")
+    elif isinstance(descr, str) and not (descr := descr.strip()):
+        # Non-empty after trimming
+        raise ValueError(f"{cls.__typename__} 'descr' cannot be empty")
 
-    irregulars = {
-        "person": "people",
-        "man": "men",
-        "woman": "women",
-        "child": "children",
-        "mouse": "mice",
-        "goose": "geese",
-        "foot": "feet",
-        "tooth": "teeth",
-        # domain-relevant
-        "operand": "operands",
-        "option": "options",
-        "switch": "switches",
-        "flag": "flags",
-        "argument": "arguments",
-        # uncountable
-        "information": "information",
-    }
-
-    if tail in irregulars:
-        tail = irregulars[tail]
-    elif tail.endswith("y") and len(tail) > 1 and tail[-2] not in "aeiou":
-        tail = tail[:-1] + "ies"
-    elif tail.endswith(("ch", "sh", "s", "x", "z")):
-        tail = tail + "es"
-    else:
-        tail = tail + "s"
-
-    return f"{head} {tail}".strip()
+    # Default description: None when Unset; preserve provided non-empty string
+    metadata["descr"] = coalesce(descr)
 
 
-def _process_metadata(cls, group, descr):
-    """
-    normalize and validate non-parametric metadata (group, descr).
-
-    parameters
-    - cls: class used only to prefix error messages.
-    - group: str | Unset
-      help section name. when provided, must be a non-empty string after trim.
-      Unset is a sentinel; note: UnsetType implements the union operator (|)
-      so runtime checks like `isinstance(x, str | Unset)` are valid here.
-      when group is Unset, a default is derived from the class name (via _pluralize).
-    - descr: str | Unset
-      short description for help. when provided, must be a non-empty string after trim.
-      as with group, Unset participates in unions (str | Unset) for direct isinstance checks.
-
-    returns
-    - dict with normalized fields: {group, descr}
-    """
-    name = cls.__name__
-
-    # group: allow Unset via the union-aware runtime check; enforce str then trim
-    if not isinstance(group, str | Unset):
-        raise TypeError(f"{name} group must be a string")
-    if isinstance(group, str) and not (group := group.strip()):
-        raise ValueError(f"{name} group must be a non-empty string")
-
-    # descr: allow Unset via the union-aware runtime check; enforce str then trim
-    if not isinstance(descr, str | Unset):
-        raise TypeError(f"{name} descr must be a string")
-    if isinstance(descr, str) and not (descr := descr.strip()):
-        raise ValueError(f"{name} descr must be a non-empty string")
-
-    return dict(
-        group=nullify(group, _pluralize(cls.__name__)),
-        descr=nullify(descr),
-    )
-
-
-def _process_named_metadata(cls, names):
+def _sanitize_named_metadata(cls, metadata, /):
     r"""
-    normalize and validate named argument metadata (option/flag names).
+    Internal: validate and normalize metadata for named (option-like) specs.
 
-    parameters
-    - cls: class used only to prefix error messages.
-    - names: Iterable[str]
-      one or more command-line names (e.g., "-v", "--verbose"). order is not
-      preserved; a deduplicated set is returned.
+    Scope
+    - Applies to value-bearing and presence-only named arguments (e.g., Option, Flag).
 
-    validation
-    - at least one name is required.
-    - each name must be a string and non-empty after strip.
-    - syntax must match:
-        ^--?[^\W\d_](?:-?[^\W_]+)*$
-      which permits:
-        • short "-x" (single leading '-'), and
-        • long "--name" with hyphen-separated unicode word segments (no '_').
-      this allows internationalized names as long as they consist of “word”
-      characters (unicode letters/digits/marks) without underscores.
-    - duplicate names are rejected.
+    Responsibilities
+    - names: required. Each name must be a non-empty string matching a shell-style
+      option pattern. Accepted forms include:
+        - short: "-x"
+        - long with single hyphen: "-long", "-long-name"
+        - long with double hyphen: "--long", "--long-name"
+      Unicode letters are allowed. Duplicates are rejected. The collection is
+      normalized into a set (order is not significant).
+    - helper/standalone/terminator/nowait wiring:
+        - standalone := standalone or helper
+        - terminator := terminator or helper
+        - nowait     := nowait or terminator
+      This ensures helper options imply standalone+terminator and that terminators
+      are executed immediately.
 
-    returns
-    - dict with normalized field: {"names": set[str]}
+    Parameters
+    - cls: the specification class, used for typename in diagnostics.
+    - metadata: dict with at least these keys
+        'names' (Iterable[str]),
+        'helper' (bool),
+        'standalone' (bool),
+        'terminator' (bool),
+        'nowait' (bool).
+      The dict is mutated in place with sanitized values.
+
+    Raises
+    - TypeError: when names are missing or contain non-string entries.
+    - ValueError: when a name is empty after trimming, fails validation, or duplicates appear.
+
+    Notes
+    - Name format regex: r"--?[^\W\d_](-?[^\W_]+)*"
+      - Optional single or double hyphen prefix.
+      - Segments separated by single hyphens (e.g., "-long-name", "--long-name").
+      - Segments start with a Unicode letter and may include Unicode letters/digits.
+      - Disallows underscores and leading digits to keep CLI style conventional.
     """
-    typename = cls.__name__
-    if not names:
-        raise TypeError(f"{typename} requires at least one name")
-    unique = set()
-    for name in names:
+    names = set()
+    if not metadata["names"]:
+        raise TypeError(f"{cls.__typename__} must specify at least one name")
+
+    for name in metadata["names"]:
         if not isinstance(name, str):
-            raise TypeError(f"all {typename} names must be strings")
+            raise TypeError(f"{cls.__typename__} names must be strings")
         elif not (name := name.strip()):
-            raise ValueError(f"{typename} names must be non-empty strings")
-        elif not re.fullmatch(r"--?[^\W\d_](?:-?[^\W_]+)*", name):
-            raise ValueError(f"{typename} names must be valid command-line argument names")
-        elif name in unique:
-            raise ValueError(f"name {name!r} for {typename} names is duplicated")
-        unique.add(name)
+            raise ValueError(f"{cls.__typename__} names cannot be empty-strings")
+        elif not re.fullmatch(r"--?[^\W\d_](-?[^\W_]+)*", name):
+            raise ValueError(f"{cls.__typename__} names must be valid shell-style option names (unicodes are allowed)")
+        elif name in names:
+            raise ValueError(f"{cls.__typename__} names cannot contain duplicates")
+        names.add(name)
 
-    return dict(names=unique)
+    metadata["names"] = names
+
+    metadata["standalone"] |= metadata["helper"]
+    metadata["terminator"] |= metadata["helper"]
+    metadata["nowait"] |= metadata["terminator"]
 
 
-def _process_variadic_metadata(cls, metavar, type, nargs, default, choices):
+def _sanitize_parametric_metadata(cls, metadata, /):
     """
-    normalize and validate variadic-style metadata for arguments.
+    Internal: validate and normalize metadata for value-bearing arguments.
 
-    scope
-    - works for both positional (cardinal) and named arguments.
-    - the “cardinal rules” (greedy remainder via ellipsis) are enabled when this
-      function infers a cardinal context (see “nargs” notes below).
+    Scope
+    - Intended exclusively for Cardinal[_T] and Option[_T], where an argument
+      carries a typed value. Flag is not handled here.
 
-    parameters
-    - cls: class
-      the argument class; used only to prefix error messages.
-    - metavar: str | Unset
-      help placeholder. when provided, must be a non-empty string; Unset means
-      “not provided”. when greedy remainder is active (ellipsis), explicit
-      metavar is not allowed.
-    - type: callable
-      per-item caster; applied to each token. for variadic arities, applied per item.
-    - nargs: str | int | Ellipsis | Unset | type
-      arity spec:
-        • None/Unset → single value
-        • "?"        → optional single value
-        • "*"        → zero or more values
-        • "+"        → one or more values
-        • int>=1     → exactly N values
-        • Ellipsis   → greedy remainder (cardinal-only)
-        • "..."      → normalized to Ellipsis when in a cardinal context
-        • special case: when a type is passed and issubclass(nargs, Cardinal) is true,
-          this function treats the context as “cardinal” for the purposes of
-          validating/normalizing “...” → Ellipsis and enforcing greedy rules.
-    - default: any
-      default value used when arity permits omission.
-    - choices: Iterable
-      allowed values. duplicates are rejected. ranges/sets are compressed to
-      frozenset; other iterables are deduplicated in order and frozen to a tuple.
+    Responsibilities
+    - metavar: must be Unset or a non-empty string after trimming. For greedy
+      arity (Ellipsis), an explicit metavar is forbidden.
+    - type: must be callable (converter/validator). No further contract enforced.
+    - nargs: must be Unset | str ("?", "+", "*") | int (>= 1) and, for Cardinal,
+      may also be Ellipsis.
+      by callers to Ellipsis; this function accepts both where applicable.
+    - choices: must be iterable. If not a Set, duplicates are rejected and
+      the collection is normalized to a tuple.
 
-    returns
-    - dict with normalized fields: {metavar, type, nargs, default, choices}
+    Explicitly not responsible for
+    - default: not validated here; it may be any value (including None) and is
+      wired externally for nargs="?" cases.
+    - group/descr: handled by the generic _sanitize_metadata routine.
 
-    notes
-    - Unset is a sentinel distinct from None; normalization to None is performed by nullify.
-    - messages are short and lowercased for consistency.
-    - cardinal context is inferred in-code (see implementation) rather than passed explicitly.
+    Side effects
+    - Mutates the provided metadata dict in place.
     """
+    # Validate and normalize 'metavar'
+    if not isinstance(metavar := metadata["metavar"], str | Unset):
+        raise TypeError(f"{cls.__typename__} 'metavar' must be a string")
+    elif isinstance(metavar, str) and not (metavar := metavar.strip()):
+        raise ValueError(f"{cls.__typename__} 'metavar' cannot be empty")
+    metadata["metavar"] = coalesce(metavar)
+
+    # Validate 'type' (converter). Trust its signature; only require callability.
+    if not callable(metadata["type"]):
+        raise TypeError(f"{cls.__typename__} 'type' must be callable")
+
+    # Cardinal supports greedy arity (Ellipsis), Option does not.
     cardinal = issubclass(cls, Cardinal)
-    typename = cls.__name__
 
-    # metavar
-    if not isinstance(metavar, str | Unset):
-        raise TypeError(f"{typename} metavar must be a string")
-    if isinstance(metavar, str) and not metavar:
-        raise ValueError(f"{typename} metavar must be a non-empty string")
-
-    # type
-    if not callable(type):
-        raise TypeError(f"{typename} type must be callable")
-
-    # nargs
-    # allow Unset/None/Ellipsis; allow strings "*", "+", "?", "..." (the latter only when cardinal); allow int>=1
-    if not (
-            nargs is Unset
-            or nargs is None
-            or nargs is Ellipsis
-            or isinstance(nargs, str)
-            or isinstance(nargs, int)
-    ):
+    # Validate 'nargs' value per kind
+    if not isinstance(nargs := metadata["nargs"], str | int | Unset | (EllipsisType if cardinal else Unset)):
         if not cardinal:
-            raise TypeError(f"{typename} nargs must be a string or an integer")
-        raise TypeError(f"{typename} nargs must be a string, an integer, or ellipsis (cardinal only)")
-
-    if isinstance(nargs, str):
-        if cardinal and nargs == "...":
-            nargs = Ellipsis
-        elif nargs not in ("*", "+", "?"):
-            if not cardinal:
-                raise ValueError(f"{typename} nargs must be '*', '+', or '?'")
-            raise ValueError(f"{typename} nargs must be '*', '+', '?', or '...'")
-
+            raise TypeError(f"{cls.__typename__} 'nargs' must be a string or an integer")
+        raise TypeError(f"{cls.__typename__} 'nargs' must be a string, an integer, or ellipsis")
+    if isinstance(nargs, str) and nargs not in ("?", "+", "*"):
+        raise ValueError(f"{cls.__typename__} 'nargs' must be one of '?', '+', or '*'")
     if isinstance(nargs, int) and nargs < 1:
-        raise ValueError(f"{typename} nargs must be a positive integer")
+        raise ValueError(f"{cls.__typename__} 'nargs' must be a positive integer")
+    metadata["nargs"] = coalesce(nargs)
 
-    if (nargs is Ellipsis) and not cardinal:
-        raise TypeError(f"{typename} nargs ellipsis is only valid for cardinals")
-
-    # greedy remainder cannot have explicit metavar
-    if cardinal and (nargs is Ellipsis) and isinstance(metavar, str):
-        raise TypeError(f"greedy {typename} does not allow explicit 'metavar'")
-
-    # choices
-    if not isinstance(choices, Iterable):
-        raise TypeError(f"{typename} choices must be iterable")
-    # freeze and de-duplicate; keep order for general iterables, compress sets/ranges
-    if isinstance(choices, (range, Set)):
-        choices = frozenset(choices)
-    else:
-        unique = []  # list to allow unhashable choices while preserving order
+    # Validate and normalize 'choices'
+    if not isinstance(choices := metadata["choices"], Iterable):
+        raise TypeError(f"{cls.__typename__} 'choices' must be iterable")
+    if not isinstance(choices, Set):
+        # Enforce no duplicates and stabilize ordering into a tuple.
+        sanitized = []
         for choice in choices:
-            if choice in unique:
-                raise ValueError(f"choice {choice!r} for {typename} choices is duplicated")
-            unique.append(choice)
-        choices = tuple(unique)
-
-    if metavar and choices:
-        warnings.warn(f"{typename} with metavar and choices, metavar is ignored in help autogeneration", stacklevel=len(inspect.stack()))
-
-    return dict(
-        metavar=nullify(metavar),
-        type=type,
-        nargs=nullify(nargs),
-        default=default,
-        choices=choices,
-    )
+            if choice in sanitized:
+                raise ValueError(f"{cls.__typename__} 'choices' cannot contain duplicates")
+            sanitized.append(choice)
+        choices = tuple(sanitized)
+    metadata["choices"] = choices
 
 
-class Cardinal[_T](StorageGuard, metaclass=_ArgumentType):
+class Cardinal[_T](metaclass=ArgumentType):
     """
-    specification for a positional (cardinal) argument.
+    Positional, value-bearing argument specification.
 
-    responsibilities
-    - carry parse-time semantics (type, nargs, default, choices).
-    - provide help metadata (metavar, group, descr).
-    - control parse flow (nowait, hidden, deprecated).
-    - expose a single-assignment callback via the synthesized mechanism
-      (stored in the internal "-callback" backing field).
+    Cardinal[_T] declares how a positional value is parsed, converted, validated,
+    and rendered in help. It is a lightweight descriptor that becomes a callable
+    handler at construction time (its __call__ is generated based on 'nargs').
 
-    notes
-    - “cardinal rules” include support for a greedy remainder via Ellipsis:
-      when nargs is Ellipsis (greedy), explicit metavar is not allowed.
-    - all public fields are read-only “views” backed by internal storage.
+    Highlights
+    - Generic over the payload type _T (converter provided via 'type').
+    - Arity: fixed (int >= 1), optional single ("?"), one-or-more ("+"),
+      zero-or-more ("*"), and greedy (Ellipsis).
+    - Help/UX metadata: metavar, group, descr, hidden, deprecated.
+    - Defaults: allowed to be any Python value; not validated here. For
+      nargs="?" cases, the default is wired into the generated __call__.
+
+    Properties
+    - The names listed in __introspectable__ are exposed as read-only attributes
+      on instances, mirroring the sanitized metadata values.
     """
 
-    __fields__ = (
+    __introspectable__ = (
         "metavar",
         "type",
         "nargs",
@@ -545,110 +478,122 @@ class Cardinal[_T](StorageGuard, metaclass=_ArgumentType):
             *,
             nowait=False,
             hidden=False,
-            deprecated=False,
+            deprecated=False
     ):
         """
-        build a new Cardinal spec.
+        Construct a Cardinal spec with the provided metadata.
 
-        parameters
-        - metavar: str | Unset
-          help placeholder; when provided, must be non-empty. forbidden when nargs is Ellipsis (greedy).
-        - type: callable
-          per-item caster; applied to each token (variadic arities apply per item).
-        - nargs: str | int | Ellipsis | Unset
-          arity:
-            • None/Unset → single value
-            • "?"        → optional single value
-            • "*"        → 0..* values
-            • "+"        → 1..* values
-            • int>=1     → exactly N values
-            • Ellipsis   → greedy remainder (consume the rest)
-        - default: any
-          default when arity permits omission.
+        Parameters
+        - metavar: Unset | str
+          Display name for the value in help. Must be non-empty if provided.
+          For greedy arity (Ellipsis/"..."), an explicit metavar is forbidden.
+        - type: Callable
+          Converter/validator applied to each parsed token. Only callability
+          is enforced here.
+        - nargs: Unset | "?" | "+" | "*" | int | Ellipsis
+          Arity of the argument. Integers must be >= 1.
+        - default: Any
+          Default value to use when arity is optional. This is intentionally
+          not validated here; it may be any value, including None.
+          Note: For nargs="?" cases, the default binding to __call__ is handled
+          by the factory, not in this initializer.
         - choices: Iterable
-          allowed values; duplicates rejected; frozen for safety.
-        - group: str | Unset
-          help section name; defaults to a plural derived from the typename.
-        - descr: str | Unset
-          short description for help.
-
-        flags
+          Allowed values. If not a Set, duplicates are rejected and the
+          sequence is normalized to a tuple for stable display.
+        - group: Unset | str
+          Category used in help. Defaults to the pluralized typename if Unset.
+        - descr: Unset | str
+          Short description for help. If Unset, becomes None.
         - nowait: bool
-          invoke callback as soon as this argument resolves.
+          If True, the handler is invoked immediately after parsing.
         - hidden: bool
-          omit from help/rendering; still parseable.
+          If True, the argument is suppressed from help output.
         - deprecated: bool
-          mark as deprecated; emit a warning when encountered.
+          If True, mark as deprecated in help and warn when specified.
 
-        behavior
-        - normalizes/validates metadata via helper functions; then constructs a
-          fenced dynamic class (factory=True) and writes backing fields during a
-          guarded build window. public attributes expose read-only views.
+        Notes
+        - Metadata is sanitized in two passes:
+          • _sanitize_metadata handles shared fields like group/descr.
+          • _sanitize_parametric_metadata handles value-bearing fields such as
+            metavar/type/nargs/choices.
+        - The dynamically generated __call__ (via the factory) is responsible
+          for forwarding parsed values to the bound callback.
         """
-        # normalize boolean flags; then merge with structural metadata
+
         metadata = {
+            "metavar": metavar,
+            "type": type,
+            "nargs": nargs,
+            "default": default,
+            "choices": choices,
+            "group": group,
+            "descr": descr,
             "nowait": bool(nowait),
             "hidden": bool(hidden),
             "deprecated": bool(deprecated),
         }
-        metadata |= _process_metadata(cls, group, descr)
-        metadata |= _process_variadic_metadata(cls, metavar, type, nargs, default, choices)  # type: ignore[arg-type]
+        # Normalize and validate shared + value-bearing metadata.
+        _sanitize_metadata(cls, metadata)
+        _sanitize_parametric_metadata(cls, metadata)
 
-        # construct a fenced dynamic class and populate backing fields under '-'
-        with super().__new__(builtins.type(cls)(cls.__name__, (cls,), {}, factory=True, **metadata)) as self:
-            # single-assignment callback backing (unset by default)
-            setattr(self, "-callback", Unset)
-            # write all declared fields to their backing names
-            for field in cls.__fields__:
-                setattr(self, "-" + field, metadata[field])
-            # greedy remainder forbids explicit metavar (defense-in-depth)
-            if self.nargs is Ellipsis and metavar is not Unset:
-                raise TypeError(f"greedy {cls.__name__} does not accept metavar")
+        # Create a sealed, factory-backed instance with a generated __call__.
+        self = super().__new__(builtins.type(cls)(cls.__name__, (cls,), dict(cls.__dict__), factory=True, **metadata))
+        self._callback = Unset  # Bound by decorators/api later.
+
+        # Mirror sanitized metadata into private fields; read-only properties expose them.
+        for name, object in metadata.items():
+            setattr(self, "_" + name, coalesce(object))
+
+        if self.nargs is Ellipsis:
+            # Greedy arity consumes all remaining tokens; in help/usage we render this
+            # as "..." to signal unbounded input. For clarity, we forbid an explicit
+            # user-provided metavar here because it would be misleading alongside "...".
+            if self.metavar:
+                raise TypeError(f"greedy {cls.__typename__} cannot specify a 'metavar'")
+            self._metavar = "..."
+
+        # UI/UX rule: either show a metavar (generic label) or enumerate concrete choices,
+        # but not both at the same time. Mixing them leads to confusing help output.
+        if self.metavar and self.choices:
+            raise TypeError(f"{cls.__typename__} cannot have both 'metavar' and 'choices'")
+
         return self
 
-    def __cardinal__(self):  # Compatibility with SupportsCardinal
+    def __cardinal__(self):
         """
-        decorator plumbing helper: return self so @cardinal(...) can expose the spec.
+        Introspection hook: identify this spec as a Cardinal.
         """
         return self
 
 
-class Option[_T](StorageGuard, metaclass=_ArgumentType):
+class Option[_T](metaclass=ArgumentType):
     """
-    specification for a named, value-bearing option.
+    Named, value-bearing option specification.
 
-    responsibilities
-    - carry parse-time semantics (names, type, nargs, default, choices).
-    - provide help metadata (metavar, group, descr).
-    - control parse flow/ux via flags (inline, helper, standalone, terminator, nowait, hidden, deprecated).
-    - expose a single-assignment callback via the synthesized mechanism
-      (stored in the internal "-callback" backing field).
+    Option[_T] declares how a named option (e.g., -o/--output) is parsed,
+    converted, validated, and rendered in help. It is a lightweight descriptor
+    that becomes a callable handler at construction time (its __call__ is
+    generated based on 'nargs').
 
-    flags (semantics)
-    - inline: bool
-      require attached/inline values only (e.g., --opt=value or -oVALUE).
-      when False, spaced forms (e.g., --opt value) are accepted per nargs rules.
-    - helper: bool
-      help-like option (e.g., --help, --version).
-      wiring: helper → standalone and terminator; and terminator → nowait.
-      constraints: helper cannot be hidden; discouraged to be deprecated (warns).
-    - standalone: bool
-      must be the only user-provided argument for the resolved command.
-    - terminator: bool
-      short-circuit after callback (e.g., version/help flows).
-    - nowait: bool
-      invoke callback as soon as this option resolves.
-    - hidden: bool
-      omit from help/pretty output; still parseable.
-    - deprecated: bool
-      mark as deprecated; emit a warning when encountered.
+    Highlights
+    - Generic over the payload type _T (converter provided via 'type').
+    - Supports aliases via 'names' (e.g., "-o", "--output", "-output").
+    - Arity: fixed (int >= 1), optional single ("?"), one-or-more ("+"),
+      zero-or-more ("*"). Greedy (Ellipsis) is not applicable to options.
+    - Inline form: when inline is True, enforces --name=value style (no space).
+    - Help/UX metadata: metavar, group, descr, hidden, deprecated.
+    - Defaults: allowed to be any Python value; not validated here. For
+      nargs="?" cases, the default is wired into the generated __call__.
+    - Helper and termination semantics:
+      • helper implies standalone and terminator
+      • terminator implies nowait
 
-    notes
-    - all public fields are read-only “views” backed by internal storage.
-    - names are validated (short "-x" or long "--name" with unicode word segments).
+    Properties
+    - The names listed in __introspectable__ are exposed as read-only attributes
+      on instances, mirroring the sanitized metadata values.
     """
 
-    __fields__ = (
+    __introspectable__ = (
         "names",
         "metavar",
         "type",
@@ -682,44 +627,70 @@ class Option[_T](StorageGuard, metaclass=_ArgumentType):
             terminator=False,
             nowait=False,
             hidden=False,
-            deprecated=False,
+            deprecated=False
     ):
         """
-        build a new Option spec.
+        Construct an Option spec with the provided metadata.
 
-        parameters
-        - names: Iterable[str]
-          one or more command-line names (e.g., "-o", "--output"); validated and deduplicated.
-        - metavar: str | Unset
-          help placeholder. when provided, must be non-empty.
-        - type: callable
-          per-item caster; applied to each token (variadic arities apply per item).
-        - nargs: str | int | Unset
-          arity (same semantics as cardinal, excluding Ellipsis):
-            • None/Unset → single value
-            • "?"        → optional single
-            • "*"        → 0..*
-            • "+"        → 1..*
-            • int>=1     → exactly N
-        - default: any
-          default when arity permits omission.
+        Parameters
+        - names: one or more str
+          Aliases for the option. Accepted forms include:
+            "-x", "-long", "-long-name", "--long", and "--long-name".
+          Names must be unique and valid shell-style identifiers (Unicode letters allowed).
+        - metavar: Unset | str
+          Display name for the value in help. Must be non-empty if provided.
+        - type: Callable
+          Converter/validator applied to each parsed token. Only callability
+          is enforced here.
+        - nargs: Unset | "?" | "+" | "*" | int
+          Arity of the option. Integers must be >= 1.
+        - default: Any
+          Default value to use when arity is optional. This is intentionally
+          not validated here; it may be any value, including None. For
+          nargs="?" cases, the default binding to __call__ is handled by
+          the factory, not in this initializer.
         - choices: Iterable
-          allowed values; duplicates rejected; frozen for safety.
-        - group: str | Unset
-          help section name; defaults to a plural derived from the typename.
-        - descr: str | Unset
-          short description for help.
+          Allowed values. If not a Set, duplicates are rejected and the
+          sequence is normalized to a tuple for stable display.
+        - group: Unset | str
+          Category used in help. Defaults to the pluralized typename if Unset.
+        - descr: Unset | str
+          Short description for help. If Unset, becomes None.
+        - inline: bool
+          If True, the option must be specified inline as --name=value (space-separated
+          form is disallowed).
+        - helper: bool
+          Marks a help-like option. Implies standalone=True and terminator=True.
+        - standalone: bool
+          Option must be specified alone (cannot be combined with others).
+        - terminator: bool
+          After handling this option, parsing should stop and the program should
+          exit or return control immediately.
+        - nowait: bool
+          Execute the handler immediately after parsing (implied by terminator).
+        - hidden: bool
+          Suppress from help output.
+        - deprecated: bool
+          Mark as deprecated in help and warn when specified.
 
-        flags
-        - inline/helper/standalone/terminator/nowait/hidden/deprecated (see class docstring).
-
-        behavior
-        - normalizes/validates metadata via helper functions; wires helper/standalone/terminator/nowait;
-          then constructs a fenced dynamic class (factory=True) and writes backing fields during a guarded
-          build window. public attributes expose read-only views.
+        Notes
+        - Metadata is sanitized in three passes:
+          • _sanitize_metadata handles shared fields like group/descr.
+          • _sanitize_named_metadata validates names and wires helper semantics.
+          • _sanitize_parametric_metadata handles value-bearing fields such as
+            metavar/type/nargs/choices (without greedy arity for options).
+        - The dynamically generated __call__ (via the factory) is responsible
+          for forwarding parsed values to the bound callback.
         """
-        # normalize boolean flags first
         metadata = {
+            "names": names,
+            "metavar": metavar,
+            "type": type,
+            "nargs": nargs,
+            "default": default,
+            "choices": choices,
+            "group": group,
+            "descr": descr,
             "inline": bool(inline),
             "helper": bool(helper),
             "standalone": bool(standalone),
@@ -728,75 +699,63 @@ class Option[_T](StorageGuard, metaclass=_ArgumentType):
             "hidden": bool(hidden),
             "deprecated": bool(deprecated),
         }
-        # helper wiring:
-        # - helper implies standalone and terminator
-        # - terminator implies nowait
-        metadata["standalone"] |= metadata["helper"]
-        metadata["terminator"] |= metadata["helper"]
-        metadata["nowait"] |= metadata["terminator"]
+        # Normalize and validate shared + named + value-bearing metadata.
+        _sanitize_metadata(cls, metadata)
+        _sanitize_named_metadata(cls, metadata)
+        _sanitize_parametric_metadata(cls, metadata)
 
-        # structural metadata (group/descr, names, nargs/type/default/choices)
-        metadata |= _process_metadata(cls, group, descr)
-        metadata |= _process_named_metadata(cls, names)
-        metadata |= _process_variadic_metadata(cls, metavar, type, nargs, default, choices)  # type: ignore[arg-type]
+        # Create a sealed, factory-backed instance with a generated __call__.
+        self = super().__new__(builtins.type(cls)(cls.__name__, (cls,), dict(cls.__dict__), factory=True, **metadata))
+        self._callback = Unset  # Bound by decorators/api later.
 
-        # construct a fenced dynamic class and populate backing fields under '-'
-        with super().__new__(builtins.type(cls)(cls.__name__, (cls,), {}, factory=True, **metadata)) as self:
-            # single-assignment callback backing (unset by default)
-            setattr(self, "-callback", Unset)
-            # write all declared fields to their backing names
-            for field in cls.__fields__:
-                setattr(self, "-" + field, metadata[field])
+        # Mirror sanitized metadata into private fields; read-only properties expose them.
+        for name, object in metadata.items():
+            setattr(self, "_" + name, coalesce(object))
 
-            # helper constraints (enforced at construction time)
-            if self.helper:
-                if self.hidden:
-                    raise TypeError(f"helper {cls.__name__} cannot be hidden")
-                if self.deprecated:
-                    # stacklevel anchored to current stack depth for a useful location
-                    warnings.warn(f"helper {cls.__name__} is deprecated", stacklevel=len(inspect.stack()))
+        # Helper options cannot be hidden or deprecated.
+        if self.helper:
+            if self.hidden:
+                raise TypeError(f"helper {cls.__typename__} cannot be hidden")
+            if self.deprecated:
+                raise TypeError(f"helper {cls.__typename__} cannot be deprecated")
+
+        # UI/UX rule: either show a metavar (generic label) or enumerate concrete choices,
+        # but not both at the same time. Mixing them leads to confusing help output.
+        if self.metavar and self.choices:
+            raise TypeError(f"{cls.__typename__} cannot have both 'metavar' and 'choices'")
+
         return self
 
     def __option__(self):
         """
-        decorator plumbing helper: return self so @option(...) can expose the spec.
+        Introspection hook: identify this spec as an Option.
         """
         return self
 
 
-class Flag(StorageGuard, metaclass=_ArgumentType):
+class Flag(metaclass=ArgumentType):
     """
-    specification for a named boolean flag (presence-only; no values).
+    Named, presence-only option specification.
 
-    responsibilities
-    - carry presence-only semantics (names).
-    - provide help metadata (group, descr).
-    - control parse flow/ux via flags (helper, standalone, terminator, nowait, hidden, deprecated).
-    - expose a single-assignment callback via the synthesized mechanism
-      (stored in the internal "-callback" backing field).
+    Flag declares how a switch-like option (e.g., -v/--verbose, --help) is
+    presented and handled. Unlike Cardinal/Option, a Flag does not carry a
+    payload value—its presence is the signal. A callable handler is generated
+    at construction time and invoked when the flag is specified.
 
-    flags (semantics)
-    - helper: bool
-      help-like flag (e.g., --help, --version).
-      wiring: helper → standalone and terminator; and terminator → nowait.
-      constraints: helper cannot be hidden; discouraged to be deprecated (warns).
-    - standalone: bool
-      must be the only user-provided argument for the resolved command.
-    - terminator: bool
-      short-circuit after callback (e.g., version/help flows).
-    - nowait: bool
-      invoke callback as soon as this flag resolves.
-    - hidden: bool
-      omit from help/pretty output; still parseable.
-    - deprecated: bool
-      mark as deprecated; emit a warning when encountered.
+    Highlights
+    - Supports aliases via 'names' (e.g., "-v", "--verbose", "-verbose").
+    - Presence-only: no metavar, type, nargs, or choices.
+    - Helper/termination semantics:
+      • helper implies standalone and terminator
+      • terminator implies nowait
+    - Help/UX metadata: group, descr, hidden, deprecated.
 
-    notes
-    - all public fields are read-only “views” backed by internal storage.
-    - names are validated (short "-x" or long "--name" with unicode word segments).
+    Properties
+    - The names listed in __introspectable__ are exposed as read-only attributes
+      on instances, mirroring the sanitized metadata values.
     """
 
-    __fields__ = (
+    __introspectable__ = (
         "names",
         "group",
         "descr",
@@ -818,29 +777,44 @@ class Flag(StorageGuard, metaclass=_ArgumentType):
             terminator=False,
             nowait=False,
             hidden=False,
-            deprecated=False,
+            deprecated=False
     ):
         """
-        build a new Flag spec.
+        Construct a Flag spec with the provided metadata.
 
-        parameters
-        - names: Iterable[str]
-          one or more command-line names (e.g., "-v", "--verbose"); validated and deduplicated.
-        - group: str | Unset
-          help section name; defaults to a plural derived from the typename.
-        - descr: str | Unset
-          short description for help.
+        Parameters
+        - names: one or more str
+          Aliases for the flag. Accepted forms include:
+            "-v", "-verbose", "--verbose", "--no-color", etc.
+          Names must be unique and valid shell-style identifiers (Unicode letters allowed).
+        - group: Unset | str
+          Category used in help. Defaults to the pluralized typename if Unset.
+        - descr: Unset | str
+          Short description for help. If Unset, becomes None.
+        - helper: bool
+          Marks a help-like flag. Implies standalone=True and terminator=True.
+        - standalone: bool
+          Flag must be specified alone (cannot be combined with others).
+        - terminator: bool
+          After handling this flag, parsing should stop and the program should
+          exit or return control immediately.
+        - nowait: bool
+          Execute the handler immediately after parsing (implied by terminator).
+        - hidden: bool
+          Suppress from help output.
+        - deprecated: bool
+          Mark as deprecated in help and warn when specified.
 
-        flags
-        - helper/standalone/terminator/nowait/hidden/deprecated (see class docstring).
-
-        behavior
-        - normalizes/validates metadata via helper functions; wires helper/standalone/terminator/nowait;
-          then constructs a fenced dynamic class (factory=True) and writes backing fields during a guarded
-          build window. public attributes expose read-only views.
+        Notes
+        - Metadata is sanitized in two passes:
+          • _sanitize_metadata handles shared fields like group/descr.
+          • _sanitize_named_metadata validates names and wires helper semantics.
+        - Flags do not accept value-bearing fields (no metavar/type/nargs/choices).
         """
-        # normalize boolean flags first
         metadata = {
+            "names": names,
+            "group": group,
+            "descr": descr,
             "helper": bool(helper),
             "standalone": bool(standalone),
             "terminator": bool(terminator),
@@ -848,182 +822,194 @@ class Flag(StorageGuard, metaclass=_ArgumentType):
             "hidden": bool(hidden),
             "deprecated": bool(deprecated),
         }
-        # helper wiring:
-        # - helper implies standalone and terminator
-        # - terminator implies nowait
-        metadata["standalone"] |= metadata["helper"]
-        metadata["terminator"] |= metadata["helper"]
-        metadata["nowait"] |= metadata["terminator"]
+        # Normalize and validate shared and named-argument metadata.
+        _sanitize_metadata(cls, metadata)
+        _sanitize_named_metadata(cls, metadata)
 
-        # structural metadata (group/descr, names)
-        metadata |= _process_metadata(cls, group, descr)
-        metadata |= _process_named_metadata(cls, names)
+        # Create a sealed, factory-backed instance with a generated __call__.
+        self = super().__new__(builtins.type(cls)(cls.__name__, (cls,), dict(cls.__dict__), factory=True, **metadata))
+        self._callback = Unset  # Bound later by the @flag(...) decorator.
 
-        # construct a fenced dynamic class and populate backing fields under '-'
-        with super().__new__(builtins.type(cls)(cls.__name__, (cls,), {}, factory=True, **metadata)) as self:
-            # single-assignment callback backing (unset by default)
-            setattr(self, "-callback", Unset)
-            # write all declared fields to their backing names
-            for field in cls.__fields__:
-                setattr(self, "-" + field, metadata[field])
+        # Mirror sanitized metadata into private fields exposed via properties.
+        for name, object in metadata.items():
+            setattr(self, "_" + name, coalesce(object))
 
-            # helper constraints (enforced at construction time)
-            if self.helper:
-                if self.hidden:
-                    raise TypeError(f"helper {cls.__name__} cannot be hidden")
-                if self.deprecated:
-                    warnings.warn(f"helper {cls.__name__} is deprecated", stacklevel=len(inspect.stack()))
+        # Helper flags must be visible and not deprecated to avoid conflicting UX.
+        if self.helper:
+            if self.hidden:
+                raise TypeError(f"helper {cls.__typename__} cannot be hidden")
+            if self.deprecated:
+                raise TypeError(f"helper {cls.__typename__} cannot be deprecated")
         return self
+
 
     def __flag__(self):
         """
-        decorator plumbing helper: return self so @flag(...) can expose the spec.
+        Introspection hook: identify this spec as a Flag.
         """
         return self
 
 
 def cardinal(*args, **kwargs):
     """
-    decorator/factory for a Cardinal (positional) specification.
+    Decorator/factory for defining a positional argument handler.
 
-    usage
-    - factory form:
-        spec = cardinal(metavar="FILE", nargs="+", type=str)
-        # later: apply the callback with decorator-style fluency
-        @spec
-        def on_files(*files): ...
-    - decorator form:
-        @cardinal(metavar="FILE", nargs="+", type=str)
-        def on_files(*files): ...
-        # returns the Cardinal instance with the callback attached.
+    Usage
+    - As a decorator with metadata:
+        @cardinal("X", type=str, nargs="?", default="DEF")
+        def on_x(x): ...
+      The decorated function becomes the handler; the decorator returns a
+      Cardinal instance whose __call__ forwards to the handler.
 
-    behavior
-    - constructs a Cardinal spec immediately from *args/**kwargs.
-    - the returned inner decorator enforces a callable and installs it as the
-      single-assignment callback by writing to the internal backing field "-callback".
-    - attaches a retrieval method __cardinal__ to the decorator so it conforms to
-      the SupportsCardinal protocol at type-checking time:
-        decorator.__cardinal__() -> Cardinal
+    - As a two-step decorator:
+        dec = cardinal("FILE")
+        @dec
+        def handle(file): ...
 
-    notes
-    - returning the spec (not the original function) is intentional; this enables
-      fluent composition while keeping a single source of truth for metadata+callback.
+    Behavior
+    - Validates that it decorates a callable and enforces single application.
+    - Binds the provided function as the Cardinal's callback.
+    - Returns the configured Cardinal instance.
+
+    Parameters
+    - *args, **kwargs: forwarded to Cardinal(...) to construct the spec.
+
+    Returns
+    - Cardinal: a value-bearing positional argument specification with the
+      decorated function bound as its handler.
     """
-
     cardinal = Cardinal(*args, **kwargs)
 
     @rename("cardinal")
-    def decorator(callback, /):
-        # validate the target; only callables can be used as handlers
+    def wrapper(callback, /):
+        # Ensure proper usage: must decorate a callable.
         if not callable(callback):
             raise TypeError("@cardinal() must be applied to a callable")
-        # (turning it into multiple specs would be ambiguous and error-prone)
-        if object.__getattribute__(cardinal, "-callback") is not Unset:
-            raise TypeError("@cardinal() factory cannot be used twice")
-        # install the handler into the internal backing storage
-        object.__setattr__(cardinal, "-callback", callback)
-        # return the spec instance (supports fluent usage)
+        # Prevent reusing the same decorator instance multiple times.
+        if cardinal._callback is not Unset:  # NOQA: E-501
+            raise TypeError("@cardinal() must be applied only once")
+        # Bind the user's function as the handler.
+        cardinal._callback = callback
         return cardinal
 
-    # expose a retrieval method to satisfy typing SupportsCardinal:
-    # calling decorator.__cardinal__() returns the underlying spec.
-    decorator.__cardinal__ = MethodType(rename(lambda self: cardinal, "__cardinal__"), decorator)
-    return decorator
+    # Advertise SupportsCardinal[_T] by attaching an introspection hook.
+    wrapper.__cardinal__ = MethodType(rename(lambda self: cardinal, "__cardinal__"), wrapper)
+    return wrapper
 
 
 def option(*args, **kwargs):
     """
-    decorator/factory for an Option (named, value-bearing) specification.
+    Decorator/factory for defining a named option handler.
 
-    usage
-    - factory form:
-        spec = option("--output", "-o", metavar="PATH")
-        @spec
-        def on_output(path): ...
-    - decorator form:
-        @option("--mode", "-m", choices=("fast", "safe"))
-        def on_mode(value): ...
-        # returns the Option instance with the callback attached.
+    Usage
+    - As a decorator with metadata:
+        @option("-o", "--output", type=str, nargs="?", default="out.txt")
+        def on_output(value): ...
+      The decorated function becomes the handler; the decorator returns an
+      Option instance whose __call__ forwards to the handler.
 
-    behavior
-    - constructs an Option spec immediately from *args/**kwargs.
-    - the returned inner decorator enforces a callable and installs it as the
-      single-assignment callback by writing to "-callback".
-    - attaches a retrieval method __option__ so the decorator conforms to a
-    - SupportsOption protocol at type-checking time:
-        decorator.__option__() -> Option
+    - As a two-step decorator:
+        dec = option("-v", "--verbose")
+        @dec
+        def on_verbose(): ...
+
+    Behavior
+    - Validates that it decorates a callable and enforces single application.
+    - Binds the provided function as the Option's callback.
+    - Returns the configured Option instance.
+
+    Parameters
+    - *args, **kwargs: forwarded to Option(...) to construct the spec
+      (names, metavar, type, nargs, default, choices, group, descr, inline,
+       helper, standalone, terminator, nowait, hidden, deprecated).
+
+    Returns
+    - Option: a value-bearing named option specification with the decorated
+      function bound as its handler.
     """
     option = Option(*args, **kwargs)
 
     @rename("option")
-    def decorator(callback, /):
-        # validate the target; only callables can be used as handlers
+    def wrapper(callback, /):
+        # Ensure proper usage: must decorate a callable.
         if not callable(callback):
             raise TypeError("@option() must be applied to a callable")
-        # single-assignment guard: prevent reusing the same factory/decorator twice
-        # (turning it into multiple specs would be ambiguous and error-prone)
-        if object.__getattribute__(option, "-callback") is not Unset:
-            raise TypeError("@option() factory cannot be used twice")
-        # install the handler into the internal backing storage
-        object.__setattr__(option, "-callback", callback)
-        # return the spec instance (supports fluent usage)
+        # Prevent reusing the same decorator instance multiple times.
+        if option._callback is not Unset:  # NOQA: E-501
+            raise TypeError("@option() must be applied only once")
+        # Bind the user's function as the handler.
+        option._callback = callback
         return option
 
-    # satisfy typing: allow retrieving the concrete spec from the decorator
-    # calling decorator.__option__() returns the underlying spec instance.
-    decorator.__option__ = MethodType(rename(lambda self: option, "__option__"), decorator)
-    return decorator
+    # Advertise SupportsOption[_T] by attaching an introspection hook.
+    wrapper.__option__ = MethodType(rename(lambda self: option, "__option__"), wrapper)
+    return wrapper
 
 
 def flag(*args, **kwargs):
     """
-    decorator/factory for a Flag (presence-only switch) specification.
+    Decorator/factory for defining a presence-only flag handler.
 
-    usage
-    - factory form:
-        spec = flag("--verbose", "-v")
-        @spec
+    Usage
+    - As a decorator with metadata:
+        @flag("-v", "--verbose")
         def on_verbose(): ...
-    - decorator form:
-        @flag("--debug")
-        def on_debug(): ...
-        # returns the Flag instance with the callback attached.
+      The decorated function becomes the handler; the decorator returns a
+      Flag instance whose __call__ triggers the handler when the flag is present.
 
-    behavior
-    - constructs a Flag spec immediately from *args/**kwargs.
-    - the returned inner decorator enforces a callable and installs it as the
-      single-assignment callback by writing to "-callback".
-    - attaches a retrieval method __flag__ so the decorator conforms to a
-      SupportsFlag protocol at type-checking time:
-        decorator.__flag__() -> Flag
+    - As a two-step decorator:
+        dec = flag("--help", helper=True, terminator=True)
+        @dec
+        def show_help(): ...
+
+    Behavior
+    - Validates that it decorates a callable and enforces single application.
+    - Binds the provided function as the Flag's callback.
+    - Returns the configured Flag instance.
+
+    Parameters
+    - *args, **kwargs: forwarded to Flag(...) to construct the spec
+      (names, group, descr, helper, standalone, terminator, nowait, hidden, deprecated).
+
+    Returns
+    - Flag: a presence-only named option specification with the decorated
+      function bound as its handler.
     """
     flag = Flag(*args, **kwargs)
 
     @rename("flag")
-    def decorator(callback, /):
-        # validate the target; only callables can be used as handlers
+    def wrapper(callback, /):
+        # Ensure proper usage: must decorate a callable.
         if not callable(callback):
             raise TypeError("@flag() must be applied to a callable")
-        # single-assignment guard: prevent reusing the same factory/decorator twice
-        # (turning it into multiple specs would be ambiguous and error-prone)
-        if object.__getattribute__(flag, "-callback") is not Unset:
-            raise TypeError("@flag() factory cannot be used twice")
-        # install the handler into the internal backing storage
-        object.__setattr__(flag, "-callback", callback)
-        # return the spec instance (supports fluent usage)
+        # Prevent reusing the same decorator instance multiple times.
+        if flag._callback is not Unset:  # NOQA: E-501
+            raise TypeError("@flag() must be applied only once")
+        # Bind the user's function as the handler.
+        flag._callback = callback
         return flag
 
-    # satisfy typing: allow retrieving the concrete spec from the decorator
-    # calling decorator.__flag__() returns the underlying spec instance.
-    decorator.__flag__ = MethodType(rename(lambda self: flag, "__flag__"), decorator)
-    return decorator
+    # Advertise SupportsFlag by attaching an introspection hook.
+    wrapper.__flag__ = MethodType(rename(lambda self: flag, "__flag__"), wrapper)
+    return wrapper
 
 
 __all__ = (
+    # Public API surface for consumers of argonaut.arguments.
+    # These names are re-exported from the package __init__.
+    # Keep this list stable: it defines the supported, documented entry points.
+
+    # Classes (specifications)
     "Cardinal",
     "Option",
     "Flag",
+
+    # Decorators (user-facing helpers to bind handlers)
     "cardinal",
     "option",
     "flag",
 )
+
+# Remove the internal metaclass from the module namespace to avoid accidental
+# exposure in docs, autocompletion, or star-imports. Not part of the public API.
+del ArgumentType
