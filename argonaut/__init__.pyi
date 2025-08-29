@@ -18,7 +18,6 @@ class VersionInfo(NamedTuple):
     micro: int
     releaselevel: Literal["alpha", "beta", "candidate", "final"]
     serial: int
-    metadata: str
 
     def __new__(
             cls,
@@ -26,8 +25,7 @@ class VersionInfo(NamedTuple):
             minor: int,
             micro: int,
             releaselevel: Literal["alpha", "beta", "candidate", "final"],
-            serial: int,
-            metadata: str,
+            serial: int
     ) -> Self: ...
 
 

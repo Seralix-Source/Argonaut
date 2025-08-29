@@ -2,7 +2,6 @@ __path__ = __import__("pkgutil").extend_path(__path__, __name__)  # NOQA: F-821
 __title__ = 'argonaut'
 __author__ = 'Eiko Reishin (影皇嶺臣)'
 __license__ = 'MIT'
-# Placeholder, modified by dynamic-versioning.
 __version__ = "0.0.0"
 
 from .arguments import *
@@ -14,12 +13,10 @@ VersionInfo = __import__("collections").namedtuple("VersionInfo", (
     "minor",
     "micro",
     "releaselevel",
-    "serial",
-    "metadata"
+    "serial"
 ))
 
-# Placeholder, modified by dynamic-versioning.
-version_info = VersionInfo(0, 0, 0, "final", 0, "")
+version_info = VersionInfo(1, 0, 0, "final", 0)
 
 __all__ = (
     "__path__",

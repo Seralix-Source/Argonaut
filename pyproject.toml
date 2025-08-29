@@ -1,26 +1,67 @@
+# -------------------------
+# Build backend
+# -------------------------
 [build-system]
-requires = ["setuptools>=69.0", "wheel"]
-build-backend = "setuptools.build_meta"
+# hatchling is simple/modern for libraries
+requires = ["hatchling>=1.21"]
+build-backend = "hatchling.build"
 
+# -------------------------
+# Project metadata
+# -------------------------
 [project]
 name = "argonaut"
-version = "0.8.0"
-description = "Composable command trees with friendly parsing, faults, and rich shell-mode UX."
+version = "1.0.0"
+description = "Empathic CLI framework: friendly help, humane errors, tiny decorator API."
 readme = "README.md"
-license = { file = "LICENSE" }
+requires-python = ">=3.12"               # built/tested on Python 3.13.5; require >=3.12
+license = { file = "license" }
 authors = [
-    { name = "Eiko Reishin (影皇嶺臣)" }
+  { name = "影皇嶺臣 (Eiko Reishin)" }
 ]
-requires-python = ">=3.11"
-dependencies = [
-    "rich>=13.0.0",
+keywords = ["cli", "command-line", "arguments", "parser", "rich"]
+classifiers = [
+  "Development Status :: 5 - Production/Stable",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Environment :: Console",
+  "Topic :: Software Development :: Libraries",
 ]
 
+# The only forced runtime dependency
+dependencies = [
+  "rich>=14.0.0",
+]
+
+# -------------------------
+# Project URLs
+# -------------------------
 [project.urls]
 Homepage = "https://github.com/Seralix-Source/Argonaut"
+Repository = "https://github.com/Seralix-Source/Argonaut"
+Issues    = "https://github.com/Seralix-Source/Argonaut/issues"
 
-[tool.setuptools.packages.find]
-include = ["argonaut*"]
+# -------------------------
+# Hatch build configuration
+# -------------------------
+[tool.hatch.build]
+# keep the sdist/wheel minimal
+include = [
+  "argonaut",   # package dir
+  "README.md",
+  "license",
+]
 
-[tool.setuptools.package-data]
-argonaut = ["*.pyi"]
+[tool.hatch.build.targets.wheel]
+packages = ["argonaut"]
+
+# -------------------------
+# Notes
+# -------------------------
+# • No dev dependencies declared (pytest/ruff/mypy) because you don’t use them.
+# • No [project.scripts] block, Argonaut ships as a library, not a CLI binary.
+# • You can always add extras or tools later if needed.
