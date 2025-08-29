@@ -946,7 +946,7 @@ class Command(metaclass=CommandType):
         if all(name not in self.switches for name in ("-v", "--version")):
             self._switches.update(dict.fromkeys({"-v", "--version"},
                 flag(
-                    "-v", "--version", descr="show this version message and exit", helper=True
+                    "-v", "--version", descr="shows a version message and exit", helper=True
                 )(self._versioner),
             ))
             self._groups["flags"].append(self.switches["--version"])
